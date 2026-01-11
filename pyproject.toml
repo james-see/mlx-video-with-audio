@@ -1,0 +1,26 @@
+[project]
+name = "mlx-video"
+version = "0.0.1"
+description = "MLX-Video is the best package for inference and finetuning of Image-Video-Audio generation models on your Mac using MLX."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.22.0",
+    "numpy",
+    "safetensors",
+    "huggingface_hub",
+    "tqdm",
+]
+license = {text="MIT"}
+authors = [
+    {name = "Prince Canuma", email = "prince.gdt@gmail.com"}
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

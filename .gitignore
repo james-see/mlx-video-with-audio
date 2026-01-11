@@ -1,0 +1,5 @@
+.env
+claude.md
+.DS_Store
+**.pyc
+__pycache__/*

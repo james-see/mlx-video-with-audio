@@ -16,7 +16,7 @@ class PixArtAlphaTextProjection(nn.Module):
 
         out_features = out_features or hidden_size
         self.linear1 = nn.Linear(in_features, hidden_size, bias=bias)
-        self.act = nn.GELU(approx="precise")  
+        self.act = nn.GELU(approx="tanh")  # Must match PyTorch's approximate="tanh"
         self.linear2 = nn.Linear(hidden_size, out_features, bias=bias)
 
     def __call__(self, x: mx.array) -> mx.array:

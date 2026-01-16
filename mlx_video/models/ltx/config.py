@@ -111,6 +111,7 @@ class LTXModelConfig(BaseModelConfig):
     audio_in_channels: int = 128
     audio_out_channels: int = 128
     audio_cross_attention_dim: int = 2048
+    audio_caption_channels: int = 3840  # Input dim for audio text embeddings (same as video)
 
     # Positional embedding config
     positional_embedding_theta: float = 10000.0

@@ -70,6 +70,9 @@ class TransformerArgsPreprocessor:
         attention_mask: Optional[mx.array] = None,
     ) -> Tuple[mx.array, Optional[mx.array]]:
         batch_size = x.shape[0]
+
+        # Context is already processed through embeddings connector in text encoder
+        # Here we just apply the caption projection
         context = self.caption_projection(context)
         context = mx.reshape(context, (batch_size, -1, x.shape[-1]))
         return context, attention_mask
@@ -282,8 +285,10 @@ class LTXModel(nn.Module):
     def _init_audio(self, config: LTXModelConfig) -> None:
         self.audio_patchify_proj = nn.Linear(config.audio_in_channels, self.audio_inner_dim, bias=True)
         self.audio_adaln_single = AdaLayerNormSingle(self.audio_inner_dim)
+
+        # Audio caption projection: receives pre-processed embeddings from text encoder's audio_embeddings_connector
         self.audio_caption_projection = PixArtAlphaTextProjection(
-            in_features=config.caption_channels,
+            in_features=config.audio_caption_channels,
             hidden_size=self.audio_inner_dim,
         )
 

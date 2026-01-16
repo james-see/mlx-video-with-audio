@@ -215,7 +215,7 @@ def generate_video(
         prompt = text_encoder.enhance_t2v(prompt, max_tokens=max_tokens, temperature=temperature, seed=seed, verbose=verbose)
         print(f"{Colors.DIM}Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}{Colors.RESET}")
 
-    text_embeddings, _ = text_encoder(prompt)
+    text_embeddings, _ = text_encoder(prompt, return_audio_embeddings=False)
     mx.eval(text_embeddings)
 
     del text_encoder

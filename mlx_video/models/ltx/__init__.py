@@ -5,3 +5,4 @@ from mlx_video.models.ltx.config import (
     LTXModelType,
 )
 from mlx_video.models.ltx.ltx import LTXModel, X0Model
+from mlx_video.models.ltx.audio_vae import AudioDecoder, Vocoder, decode_audio

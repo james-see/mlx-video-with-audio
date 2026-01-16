@@ -291,6 +291,59 @@ def sanitize_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
     return sanitized
 
 
+def sanitize_vae_encoder_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    """Sanitize VAE encoder weight names from PyTorch format to MLX format.
+
+    Args:
+        weights: Dictionary of weights with PyTorch naming
+
+    Returns:
+        Dictionary with MLX-compatible naming for VAE encoder
+    """
+    sanitized = {}
+
+    for key, value in weights.items():
+        new_key = key
+
+        # Skip position_ids (not needed)
+        if "position_ids" in key:
+            continue
+
+        # Only process VAE encoder weights
+        if not key.startswith("vae."):
+            continue
+
+        # Handle per-channel statistics key mapping
+        if "vae.per_channel_statistics" in key:
+            if key == "vae.per_channel_statistics.mean-of-means":
+                new_key = "per_channel_statistics._mean_of_means"
+            elif key == "vae.per_channel_statistics.std-of-means":
+                new_key = "per_channel_statistics._std_of_means"
+            else:
+                # Skip other per_channel_statistics keys
+                continue
+        elif key.startswith("vae.encoder."):
+            # Strip the vae.encoder. prefix for encoder weights
+            new_key = key.replace("vae.encoder.", "")
+        else:
+            # Skip other vae.* keys that are not encoder weights
+            continue
+
+        # Handle Conv3d weight shape conversion
+        # PyTorch: (out_channels, in_channels, D, H, W)
+        # MLX: (out_channels, D, H, W, in_channels)
+        if "conv" in new_key.lower() and "weight" in new_key and value.ndim == 5:
+            value = mx.transpose(value, (0, 2, 3, 4, 1))
+
+        # Handle Conv2d weight shape conversion
+        if "conv" in new_key.lower() and "weight" in new_key and value.ndim == 4:
+            value = mx.transpose(value, (0, 2, 3, 1))
+
+        sanitized[new_key] = value
+
+    return sanitized
+
+
 def sanitize_audio_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
     """Sanitize audio VAE weight names from PyTorch format to MLX format.
 

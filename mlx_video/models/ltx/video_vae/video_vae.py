@@ -273,9 +273,9 @@ class VideoEncoder(nn.Module):
             spatial_padding_mode=encoder_spatial_padding_mode,
         )
 
-        # Build encoder blocks
-        self.down_blocks = []
-        for block_name, block_params in encoder_blocks:
+        # Build encoder blocks - use dict with int keys for MLX parameter tracking
+        self.down_blocks = {}
+        for i, (block_name, block_params) in enumerate(encoder_blocks):
             block_config = {"num_layers": block_params} if isinstance(block_params, int) else block_params
 
             block, feature_channels = _make_encoder_block(
@@ -287,7 +287,7 @@ class VideoEncoder(nn.Module):
                 norm_num_groups=self._norm_num_groups,
                 spatial_padding_mode=encoder_spatial_padding_mode,
             )
-            self.down_blocks.append(block)
+            self.down_blocks[i] = block
 
         # Output normalization and convolution
         if norm_layer == NormLayerType.GROUP_NORM:
@@ -341,7 +341,7 @@ class VideoEncoder(nn.Module):
         sample = self.conv_in(sample, causal=True)
 
         # Process through encoder blocks
-        for down_block in self.down_blocks:
+        for down_block in self.down_blocks.values():
             if isinstance(down_block, (UNetMidBlock3D, ResnetBlock3D)):
                 sample = down_block(sample, causal=True)
             else:

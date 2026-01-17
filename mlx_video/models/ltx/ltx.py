@@ -52,10 +52,11 @@ class TransformerArgsPreprocessor:
         self,
         timestep: mx.array,
         batch_size: int,
+        hidden_dtype: mx.Dtype = None,
     ) -> Tuple[mx.array, mx.array]:
 
         timestep = timestep * self.timestep_scale_multiplier
-        timestep_emb, embedded_timestep = self.adaln(timestep.reshape(-1))
+        timestep_emb, embedded_timestep = self.adaln(timestep.reshape(-1), hidden_dtype=hidden_dtype)
 
         # Reshape to (batch, tokens, dim)
         timestep_emb = mx.reshape(timestep_emb, (batch_size, -1, timestep_emb.shape[-1]))
@@ -117,7 +118,7 @@ class TransformerArgsPreprocessor:
 
     def prepare(self, modality: Modality) -> TransformerArgs:
         x = self.patchify_proj(modality.latent)
-        timestep, embedded_timestep = self._prepare_timestep(modality.timesteps, x.shape[0])
+        timestep, embedded_timestep = self._prepare_timestep(modality.timesteps, x.shape[0], hidden_dtype=x.dtype)
         context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
         attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
         pe = self._prepare_positional_embeddings(
@@ -201,6 +202,7 @@ class MultiModalTransformerArgsPreprocessor:
             timestep=modality.timesteps,
             timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
             batch_size=transformer_args.x.shape[0],
+            hidden_dtype=transformer_args.x.dtype,
         )
 
         return replace(
@@ -215,15 +217,16 @@ class MultiModalTransformerArgsPreprocessor:
         timestep: mx.array,
         timestep_scale_multiplier: int,
         batch_size: int,
+        hidden_dtype: mx.Dtype = None,
     ) -> Tuple[mx.array, mx.array]:
         timestep = timestep * timestep_scale_multiplier
 
         av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
-        scale_shift_timestep, _ = self.cross_scale_shift_adaln(timestep.reshape(-1))
+        scale_shift_timestep, _ = self.cross_scale_shift_adaln(timestep.reshape(-1), hidden_dtype=hidden_dtype)
         scale_shift_timestep = mx.reshape(scale_shift_timestep, (batch_size, -1, scale_shift_timestep.shape[-1]))
 
-        gate_timestep, _ = self.cross_gate_adaln(timestep.reshape(-1) * av_ca_factor)
+        gate_timestep, _ = self.cross_gate_adaln(timestep.reshape(-1) * av_ca_factor, hidden_dtype=hidden_dtype)
         gate_timestep = mx.reshape(gate_timestep, (batch_size, -1, gate_timestep.shape[-1]))
 
         return scale_shift_timestep, gate_timestep

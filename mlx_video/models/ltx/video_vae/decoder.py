@@ -348,10 +348,11 @@ class LTX2VideoDecoder(nn.Module):
 
     def denormalize(self, x: mx.array) -> mx.array:
         """Denormalize latents using per-channel statistics."""
+        dtype = x.dtype
         # Cast to float32 for precision (statistics may be in bfloat16)
         mean = self.latents_mean.astype(mx.float32).reshape(1, -1, 1, 1, 1)
         std = self.latents_std.astype(mx.float32).reshape(1, -1, 1, 1, 1)
-        return x * std + mean
+        return (x * std + mean).astype(dtype)
 
     def pixel_norm(self, x: mx.array, eps: float = 1e-8) -> mx.array:
         """Apply pixel normalization."""

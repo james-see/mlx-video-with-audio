@@ -26,8 +26,17 @@ class Colors:
 from mlx_video.models.ltx.config import LTXModelConfig, LTXModelType, LTXRopeType
 from mlx_video.models.ltx.ltx import LTXModel
 from mlx_video.models.ltx.transformer import Modality
-from mlx_video.convert import sanitize_transformer_weights, sanitize_audio_vae_weights, sanitize_vocoder_weights
-from mlx_video.utils import to_denoised, get_model_path, load_image, prepare_image_for_encoding
+from mlx_video.convert import (
+    sanitize_transformer_weights,
+    sanitize_audio_vae_weights,
+    sanitize_vocoder_weights,
+)
+from mlx_video.utils import (
+    to_denoised,
+    get_model_path,
+    load_image,
+    prepare_image_for_encoding,
+)
 from mlx_video.models.ltx.video_vae.decoder import load_vae_decoder
 from mlx_video.models.ltx.video_vae.encoder import load_vae_encoder
 from mlx_video.models.ltx.video_vae.tiling import TilingConfig
@@ -40,6 +49,39 @@ from mlx_video.conditioning.latent import LatentState, apply_denoise_mask
 STAGE_1_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 
+# Default HuggingFace model for text encoder
+DEFAULT_HF_MODEL = "Lightricks/LTX-2"
+
+
+def is_unified_mlx_model(model_path: Path) -> bool:
+    """Check if model_path contains a unified MLX model.
+
+    Unified MLX models have:
+    - model.safetensors (single unified weights file)
+    - config.json
+    - No ltx-2-19b-distilled.safetensors (HuggingFace format)
+    """
+    model_path = Path(model_path)
+    has_unified = (model_path / "model.safetensors").exists()
+    has_config = (model_path / "config.json").exists()
+    has_hf_format = (model_path / "ltx-2-19b-distilled.safetensors").exists()
+    return has_unified and has_config and not has_hf_format
+
+
+def load_unified_weights(model_path: Path, prefix: str) -> dict:
+    """Load weights from unified MLX model with given prefix.
+
+    Args:
+        model_path: Path to unified model directory
+        prefix: Prefix to filter weights (e.g., 'transformer.', 'vae_decoder.')
+
+    Returns:
+        Dictionary of weights with prefix stripped
+    """
+    all_weights = mx.load(str(model_path / "model.safetensors"))
+    return {k[len(prefix) :]: v for k, v in all_weights.items() if k.startswith(prefix)}
+
+
 # Audio constants
 AUDIO_SAMPLE_RATE = 24000  # Output audio sample rate
 AUDIO_LATENT_SAMPLE_RATE = 16000  # VAE internal sample rate
@@ -47,7 +89,9 @@ AUDIO_HOP_LENGTH = 160
 AUDIO_LATENT_DOWNSAMPLE_FACTOR = 4
 AUDIO_LATENT_CHANNELS = 8  # Latent channels before patchifying
 AUDIO_MEL_BINS = 16
-AUDIO_LATENTS_PER_SECOND = AUDIO_LATENT_SAMPLE_RATE / AUDIO_HOP_LENGTH / AUDIO_LATENT_DOWNSAMPLE_FACTOR  # 25
+AUDIO_LATENTS_PER_SECOND = (
+    AUDIO_LATENT_SAMPLE_RATE / AUDIO_HOP_LENGTH / AUDIO_LATENT_DOWNSAMPLE_FACTOR
+)  # 25
 
 
 def create_video_position_grid(
@@ -67,10 +111,12 @@ def create_video_position_grid(
     h_coords = np.arange(0, height, patch_size_h)
     w_coords = np.arange(0, width, patch_size_w)
 
-    t_grid, h_grid, w_grid = np.meshgrid(t_coords, h_coords, w_coords, indexing='ij')
+    t_grid, h_grid, w_grid = np.meshgrid(t_coords, h_coords, w_coords, indexing="ij")
     patch_starts = np.stack([t_grid, h_grid, w_grid], axis=0)
 
-    patch_size_delta = np.array([patch_size_t, patch_size_h, patch_size_w]).reshape(3, 1, 1, 1)
+    patch_size_delta = np.array([patch_size_t, patch_size_h, patch_size_w]).reshape(
+        3, 1, 1, 1
+    )
     patch_ends = patch_starts + patch_size_delta
 
     latent_coords = np.stack([patch_starts, patch_ends], axis=-1)
@@ -78,14 +124,14 @@ def create_video_position_grid(
     latent_coords = latent_coords.reshape(3, num_patches, 2)
     latent_coords = np.tile(latent_coords[np.newaxis, ...], (batch_size, 1, 1, 1))
 
-    scale_factors = np.array([temporal_scale, spatial_scale, spatial_scale]).reshape(1, 3, 1, 1)
+    scale_factors = np.array([temporal_scale, spatial_scale, spatial_scale]).reshape(
+        1, 3, 1, 1
+    )
     pixel_coords = (latent_coords * scale_factors).astype(np.float32)
 
     if causal_fix:
         pixel_coords[:, 0, :, :] = np.clip(
-            pixel_coords[:, 0, :, :] + 1 - temporal_scale,
-            a_min=0,
-            a_max=None
+            pixel_coords[:, 0, :, :] + 1 - temporal_scale, a_min=0, a_max=None
         )
 
     pixel_coords[:, 0, :, :] = pixel_coords[:, 0, :, :] / fps
@@ -106,6 +152,7 @@ def create_audio_position_grid(
     Audio positions are timestamps in seconds, shape (B, 1, T, 2).
     Matches PyTorch's AudioPatchifier.get_patch_grid_bounds exactly.
     """
+
     def get_audio_latent_time_in_sec(start_idx: int, end_idx: int) -> np.ndarray:
         """Convert latent indices to seconds (matching PyTorch's _get_audio_latent_time_in_sec)."""
         latent_frame = np.arange(start_idx, end_idx, dtype=np.float32)
@@ -213,11 +260,15 @@ def denoise_av(
             enabled=True,
         )
 
-        video_velocity, audio_velocity = transformer(video=video_modality, audio=audio_modality)
+        video_velocity, audio_velocity = transformer(
+            video=video_modality, audio=audio_modality
+        )
         mx.eval(video_velocity, audio_velocity)
 
         # Reshape velocities back
-        video_velocity = mx.reshape(mx.transpose(video_velocity, (0, 2, 1)), (b, c, f, h, w))
+        video_velocity = mx.reshape(
+            mx.transpose(video_velocity, (0, 2, 1)), (b, c, f, h, w)
+        )
         audio_velocity = mx.reshape(audio_velocity, (ab, at, ac, af))
         audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))  # (B, C, T, F)
 
@@ -227,7 +278,9 @@ def denoise_av(
 
         # Apply conditioning mask for video if state is provided
         if video_state is not None:
-            video_denoised = apply_denoise_mask(video_denoised, video_state.clean_latent, video_state.denoise_mask)
+            video_denoised = apply_denoise_mask(
+                video_denoised, video_state.clean_latent, video_state.denoise_mask
+            )
 
         mx.eval(video_denoised, audio_denoised)
 
@@ -235,8 +288,14 @@ def denoise_av(
         if sigma_next > 0:
             sigma_next_arr = mx.array(sigma_next, dtype=dtype)
             sigma_arr = mx.array(sigma, dtype=dtype)
-            video_latents = video_denoised + sigma_next_arr * (video_latents - video_denoised) / sigma_arr
-            audio_latents = audio_denoised + sigma_next_arr * (audio_latents - audio_denoised) / sigma_arr
+            video_latents = (
+                video_denoised
+                + sigma_next_arr * (video_latents - video_denoised) / sigma_arr
+            )
+            audio_latents = (
+                audio_denoised
+                + sigma_next_arr * (audio_latents - audio_denoised) / sigma_arr
+            )
         else:
             video_latents = video_denoised
             audio_latents = audio_denoised
@@ -245,8 +304,13 @@ def denoise_av(
     return video_latents, audio_latents
 
 
-def load_audio_decoder(model_path: Path):
-    """Load audio VAE decoder."""
+def load_audio_decoder(model_path: Path, use_unified: bool = False):
+    """Load audio VAE decoder.
+
+    Args:
+        model_path: Path to model directory
+        use_unified: If True, load from unified MLX format
+    """
     from mlx_video.models.ltx.audio_vae import AudioDecoder, CausalityAxis, NormType
 
     decoder = AudioDecoder(
@@ -262,25 +326,48 @@ def load_audio_decoder(model_path: Path):
         mel_bins=64,  # Output mel bins
     )
 
-    # Load weights from main model file
-    weight_file = model_path / "ltx-2-19b-distilled.safetensors"
-    if weight_file.exists():
-        raw_weights = mx.load(str(weight_file))
-        sanitized = sanitize_audio_vae_weights(raw_weights)
+    if use_unified:
+        # Load from unified MLX model (weights already sanitized)
+        sanitized = load_unified_weights(model_path, "audio_vae.")
         if sanitized:
             decoder.load_weights(list(sanitized.items()), strict=False)
-
-            # Manually load per-channel statistics (they're plain mx.array, not tracked by load_weights)
+            # Manually load per-channel statistics
             if "per_channel_statistics._mean_of_means" in sanitized:
-                decoder.per_channel_statistics._mean_of_means = sanitized["per_channel_statistics._mean_of_means"]
+                decoder.per_channel_statistics._mean_of_means = sanitized[
+                    "per_channel_statistics._mean_of_means"
+                ]
             if "per_channel_statistics._std_of_means" in sanitized:
-                decoder.per_channel_statistics._std_of_means = sanitized["per_channel_statistics._std_of_means"]
+                decoder.per_channel_statistics._std_of_means = sanitized[
+                    "per_channel_statistics._std_of_means"
+                ]
+    else:
+        # Load from HuggingFace format (needs sanitization)
+        weight_file = model_path / "ltx-2-19b-distilled.safetensors"
+        if weight_file.exists():
+            raw_weights = mx.load(str(weight_file))
+            sanitized = sanitize_audio_vae_weights(raw_weights)
+            if sanitized:
+                decoder.load_weights(list(sanitized.items()), strict=False)
+                # Manually load per-channel statistics
+                if "per_channel_statistics._mean_of_means" in sanitized:
+                    decoder.per_channel_statistics._mean_of_means = sanitized[
+                        "per_channel_statistics._mean_of_means"
+                    ]
+                if "per_channel_statistics._std_of_means" in sanitized:
+                    decoder.per_channel_statistics._std_of_means = sanitized[
+                        "per_channel_statistics._std_of_means"
+                    ]
 
     return decoder
 
 
-def load_vocoder(model_path: Path):
-    """Load vocoder for mel to waveform conversion."""
+def load_vocoder(model_path: Path, use_unified: bool = False):
+    """Load vocoder for mel to waveform conversion.
+
+    Args:
+        model_path: Path to model directory
+        use_unified: If True, load from unified MLX format
+    """
     from mlx_video.models.ltx.audio_vae import Vocoder
 
     vocoder = Vocoder(
@@ -293,13 +380,19 @@ def load_vocoder(model_path: Path):
         output_sample_rate=AUDIO_SAMPLE_RATE,
     )
 
-    # Load weights
-    weight_file = model_path / "ltx-2-19b-distilled.safetensors"
-    if weight_file.exists():
-        raw_weights = mx.load(str(weight_file))
-        sanitized = sanitize_vocoder_weights(raw_weights)
+    if use_unified:
+        # Load from unified MLX model (weights already sanitized)
+        sanitized = load_unified_weights(model_path, "vocoder.")
         if sanitized:
             vocoder.load_weights(list(sanitized.items()), strict=False)
+    else:
+        # Load from HuggingFace format (needs sanitization)
+        weight_file = model_path / "ltx-2-19b-distilled.safetensors"
+        if weight_file.exists():
+            raw_weights = mx.load(str(weight_file))
+            sanitized = sanitize_vocoder_weights(raw_weights)
+            if sanitized:
+                vocoder.load_weights(list(sanitized.items()), strict=False)
 
     return vocoder
 
@@ -317,7 +410,7 @@ def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RA
     audio = np.clip(audio, -1.0, 1.0)
     audio_int16 = (audio * 32767).astype(np.int16)
 
-    with wave.open(str(path), 'wb') as wf:
+    with wave.open(str(path), "wb") as wf:
         wf.setnchannels(2 if audio_int16.ndim == 2 else 1)
         wf.setsampwidth(2)  # 16-bit
         wf.setframerate(sample_rate)
@@ -329,13 +422,18 @@ def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path):
     import subprocess
 
     cmd = [
-        "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-i", str(audio_path),
-        "-c:v", "copy",
-        "-c:a", "aac",
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-i",
+        str(audio_path),
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
         "-shortest",
-        str(output_path)
+        str(output_path),
     ]
 
     try:
@@ -399,7 +497,9 @@ def generate_video_with_audio(
 
     if num_frames % 8 != 1:
         adjusted_num_frames = round((num_frames - 1) / 8) * 8 + 1
-        print(f"{Colors.YELLOW}⚠️  Adjusted frames to {adjusted_num_frames}{Colors.RESET}")
+        print(
+            f"{Colors.YELLOW}⚠️  Adjusted frames to {adjusted_num_frames}{Colors.RESET}"
+        )
         num_frames = adjusted_num_frames
 
     # Calculate audio frames
@@ -407,14 +507,36 @@ def generate_video_with_audio(
 
     is_i2v = image is not None
     mode_str = "I2V+Audio" if is_i2v else "T2V+Audio"
-    print(f"{Colors.BOLD}{Colors.CYAN}🎬 [{mode_str}] Generating {width}x{height} video with {num_frames} frames + audio{Colors.RESET}")
-    print(f"{Colors.DIM}Audio: {audio_frames} latent frames @ {AUDIO_SAMPLE_RATE}Hz{Colors.RESET}")
-    print(f"{Colors.DIM}Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}{Colors.RESET}")
+    print(
+        f"{Colors.BOLD}{Colors.CYAN}🎬 [{mode_str}] Generating {width}x{height} video with {num_frames} frames + audio{Colors.RESET}"
+    )
+    print(
+        f"{Colors.DIM}Audio: {audio_frames} latent frames @ {AUDIO_SAMPLE_RATE}Hz{Colors.RESET}"
+    )
+    print(
+        f"{Colors.DIM}Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}{Colors.RESET}"
+    )
     if is_i2v:
-        print(f"{Colors.DIM}Image: {image} (strength={image_strength}, frame={image_frame_idx}){Colors.RESET}")
+        print(
+            f"{Colors.DIM}Image: {image} (strength={image_strength}, frame={image_frame_idx}){Colors.RESET}"
+        )
 
     model_path = get_model_path(model_repo)
-    text_encoder_path = model_path if text_encoder_repo is None else get_model_path(text_encoder_repo)
+
+    # Check if using unified MLX model format
+    use_unified = is_unified_mlx_model(model_path)
+    if use_unified:
+        print(f"{Colors.DIM}Using unified MLX model format{Colors.RESET}")
+        # For unified models, we still need HuggingFace model for text encoder and upsampler
+        hf_model_path = get_model_path(text_encoder_repo or DEFAULT_HF_MODEL)
+        text_encoder_path = hf_model_path
+    else:
+        text_encoder_path = (
+            model_path
+            if text_encoder_repo is None
+            else get_model_path(text_encoder_repo)
+        )
+        hf_model_path = model_path  # For upsampler, VAE, etc.
 
     # Calculate latent dimensions
     stage1_h, stage1_w = height // 2 // 32, width // 2 // 32
@@ -426,15 +548,24 @@ def generate_video_with_audio(
     # Load text encoder with audio embeddings
     print(f"{Colors.BLUE}📝 Loading text encoder...{Colors.RESET}")
     from mlx_video.models.ltx.text_encoder import LTX2TextEncoder
+
     text_encoder = LTX2TextEncoder()
-    text_encoder.load(model_path=model_path, text_encoder_path=text_encoder_path)
+    text_encoder.load(model_path=hf_model_path, text_encoder_path=text_encoder_path)
     mx.eval(text_encoder.parameters())
 
     # Optionally enhance prompt
     if enhance_prompt:
         print(f"{Colors.MAGENTA}✨ Enhancing prompt...{Colors.RESET}")
-        prompt = text_encoder.enhance_t2v(prompt, max_tokens=max_tokens, temperature=temperature, seed=seed, verbose=verbose)
-        print(f"{Colors.DIM}Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}{Colors.RESET}")
+        prompt = text_encoder.enhance_t2v(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            verbose=verbose,
+        )
+        print(
+            f"{Colors.DIM}Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}{Colors.RESET}"
+        )
 
     # Get both video and audio embeddings
     video_embeddings, audio_embeddings = text_encoder(prompt)
@@ -446,11 +577,18 @@ def generate_video_with_audio(
 
     # Load transformer with AudioVideo config
     print(f"{Colors.BLUE}🤖 Loading transformer (A/V mode)...{Colors.RESET}")
-    raw_weights = mx.load(str(model_path / 'ltx-2-19b-distilled.safetensors'))
-    sanitized = sanitize_transformer_weights(raw_weights)
-
-    # Convert transformer weights to bfloat16 for memory efficiency
-    sanitized = {k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v for k, v in sanitized.items()}
+    if use_unified:
+        # Load from unified MLX model (weights already sanitized and converted)
+        sanitized = load_unified_weights(model_path, "transformer.")
+    else:
+        # Load from HuggingFace format (needs sanitization)
+        raw_weights = mx.load(str(model_path / "ltx-2-19b-distilled.safetensors"))
+        sanitized = sanitize_transformer_weights(raw_weights)
+        # Convert transformer weights to bfloat16 for memory efficiency
+        sanitized = {
+            k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v
+            for k, v in sanitized.items()
+        }
 
     config = LTXModelConfig(
         model_type=LTXModelType.AudioVideo,
@@ -484,19 +622,30 @@ def generate_video_with_audio(
     stage1_image_latent = None
     stage2_image_latent = None
     if is_i2v:
-        print(f"{Colors.BLUE}🖼️  Loading VAE encoder and encoding image...{Colors.RESET}")
-        vae_encoder = load_vae_encoder(str(model_path / 'ltx-2-19b-distilled.safetensors'))
+        print(
+            f"{Colors.BLUE}🖼️  Loading VAE encoder and encoding image...{Colors.RESET}"
+        )
+        # VAE encoder always comes from HuggingFace model (not in unified format)
+        vae_encoder = load_vae_encoder(
+            str(hf_model_path / "ltx-2-19b-distilled.safetensors")
+        )
         mx.eval(vae_encoder.parameters())
 
         # Load and prepare image for stage 1 (half resolution)
-        input_image = load_image(image, height=height // 2, width=width // 2, dtype=model_dtype)
-        stage1_image_tensor = prepare_image_for_encoding(input_image, height // 2, width // 2, dtype=model_dtype)
+        input_image = load_image(
+            image, height=height // 2, width=width // 2, dtype=model_dtype
+        )
+        stage1_image_tensor = prepare_image_for_encoding(
+            input_image, height // 2, width // 2, dtype=model_dtype
+        )
         stage1_image_latent = vae_encoder(stage1_image_tensor)
         mx.eval(stage1_image_latent)
 
         # Load and prepare image for stage 2 (full resolution)
         input_image = load_image(image, height=height, width=width, dtype=model_dtype)
-        stage2_image_tensor = prepare_image_for_encoding(input_image, height, width, dtype=model_dtype)
+        stage2_image_tensor = prepare_image_for_encoding(
+            input_image, height, width, dtype=model_dtype
+        )
         stage2_image_latent = vae_encoder(stage2_image_tensor)
         mx.eval(stage2_image_latent)
 
@@ -504,12 +653,16 @@ def generate_video_with_audio(
         mx.clear_cache()
 
     # Initialize latents
-    print(f"{Colors.YELLOW}⚡ Stage 1: Generating at {width//2}x{height//2} (8 steps)...{Colors.RESET}")
+    print(
+        f"{Colors.YELLOW}⚡ Stage 1: Generating at {width//2}x{height//2} (8 steps)...{Colors.RESET}"
+    )
     mx.random.seed(seed)
 
     # Create position grids - MUST stay float32 for RoPE precision
     # bfloat16 positions cause quality degradation due to precision loss in sin/cos calculations
-    video_positions = create_video_position_grid(1, latent_frames, stage1_h, stage1_w)  # float32
+    video_positions = create_video_position_grid(
+        1, latent_frames, stage1_h, stage1_w
+    )  # float32
     audio_positions = create_audio_position_grid(1, audio_frames)  # float32
     mx.eval(video_positions, audio_positions)
 
@@ -535,7 +688,8 @@ def generate_video_with_audio(
         noise_scale = mx.array(STAGE_1_SIGMAS[0], dtype=model_dtype)  # 1.0
         scaled_mask = video_state1.denoise_mask * noise_scale
         video_state1 = LatentState(
-            latent=noise * scaled_mask + video_state1.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
+            latent=noise * scaled_mask
+            + video_state1.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
             clean_latent=video_state1.clean_latent,
             denoise_mask=video_state1.denoise_mask,
         )
@@ -547,38 +701,55 @@ def generate_video_with_audio(
         mx.eval(video_latents)
 
     # Audio always uses pure noise (no I2V for audio)
-    audio_latents = mx.random.normal((1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS)).astype(model_dtype)
+    audio_latents = mx.random.normal(
+        (1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS)
+    ).astype(model_dtype)
     mx.eval(audio_latents)
 
     # Stage 1 denoising
     video_latents, audio_latents = denoise_av(
-        video_latents, audio_latents,
-        video_positions, audio_positions,
-        video_embeddings, audio_embeddings,
-        transformer, STAGE_1_SIGMAS, verbose=verbose,
-        video_state=video_state1
+        video_latents,
+        audio_latents,
+        video_positions,
+        audio_positions,
+        video_embeddings,
+        audio_embeddings,
+        transformer,
+        STAGE_1_SIGMAS,
+        verbose=verbose,
+        video_state=video_state1,
     )
 
     # Upsample video latents
     print(f"{Colors.MAGENTA}🔍 Upsampling video latents 2x...{Colors.RESET}")
-    upsampler = load_upsampler(str(model_path / 'ltx-2-spatial-upscaler-x2-1.0.safetensors'))
+    # Upsampler always comes from HuggingFace model (separate file)
+    upsampler = load_upsampler(
+        str(hf_model_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors")
+    )
     mx.eval(upsampler.parameters())
 
+    # VAE decoder from HuggingFace (unified format doesn't include latent stats needed for upsampling)
     vae_decoder = load_vae_decoder(
-        str(model_path / 'ltx-2-19b-distilled.safetensors'),
-        timestep_conditioning=None  # Auto-detect from model metadata
+        str(hf_model_path / "ltx-2-19b-distilled.safetensors"),
+        timestep_conditioning=None,  # Auto-detect from model metadata
     )
 
-    video_latents = upsample_latents(video_latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std)
+    video_latents = upsample_latents(
+        video_latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std
+    )
     mx.eval(video_latents)
 
     del upsampler
     mx.clear_cache()
 
     # Stage 2: Refine at full resolution
-    print(f"{Colors.YELLOW}⚡ Stage 2: Refining at {width}x{height} (3 steps)...{Colors.RESET}")
+    print(
+        f"{Colors.YELLOW}⚡ Stage 2: Refining at {width}x{height} (3 steps)...{Colors.RESET}"
+    )
     # Position grids stay float32 for RoPE precision
-    video_positions = create_video_position_grid(1, latent_frames, stage2_h, stage2_w)  # float32
+    video_positions = create_video_position_grid(
+        1, latent_frames, stage2_h, stage2_w
+    )  # float32
     mx.eval(video_positions)
 
     # Apply I2V conditioning for stage 2 if provided
@@ -602,7 +773,8 @@ def generate_video_with_audio(
         noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
         scaled_mask = video_state2.denoise_mask * noise_scale
         video_state2 = LatentState(
-            latent=video_noise * scaled_mask + video_state2.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
+            latent=video_noise * scaled_mask
+            + video_state2.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
             clean_latent=video_state2.clean_latent,
             denoise_mask=video_state2.denoise_mask,
         )
@@ -625,11 +797,16 @@ def generate_video_with_audio(
         mx.eval(video_latents, audio_latents)
 
     video_latents, audio_latents = denoise_av(
-        video_latents, audio_latents,
-        video_positions, audio_positions,
-        video_embeddings, audio_embeddings,
-        transformer, STAGE_2_SIGMAS, verbose=verbose,
-        video_state=video_state2
+        video_latents,
+        audio_latents,
+        video_positions,
+        audio_positions,
+        video_embeddings,
+        audio_embeddings,
+        transformer,
+        STAGE_2_SIGMAS,
+        verbose=verbose,
+        video_state=video_state2,
     )
 
     del transformer
@@ -654,14 +831,28 @@ def generate_video_with_audio(
     elif tiling == "temporal":
         tiling_config = TilingConfig.temporal_only()
     else:
-        print(f"{Colors.YELLOW}  Unknown tiling mode '{tiling}', using auto{Colors.RESET}")
+        print(
+            f"{Colors.YELLOW}  Unknown tiling mode '{tiling}', using auto{Colors.RESET}"
+        )
         tiling_config = TilingConfig.auto(height, width, num_frames)
 
     if tiling_config is not None:
-        spatial_info = f"{tiling_config.spatial_config.tile_size_in_pixels}px" if tiling_config.spatial_config else "none"
-        temporal_info = f"{tiling_config.temporal_config.tile_size_in_frames}f" if tiling_config.temporal_config else "none"
-        print(f"{Colors.DIM}  Tiling ({tiling}): spatial={spatial_info}, temporal={temporal_info}{Colors.RESET}")
-        video = vae_decoder.decode_tiled(video_latents, tiling_config=tiling_config, debug=verbose)
+        spatial_info = (
+            f"{tiling_config.spatial_config.tile_size_in_pixels}px"
+            if tiling_config.spatial_config
+            else "none"
+        )
+        temporal_info = (
+            f"{tiling_config.temporal_config.tile_size_in_frames}f"
+            if tiling_config.temporal_config
+            else "none"
+        )
+        print(
+            f"{Colors.DIM}  Tiling ({tiling}): spatial={spatial_info}, temporal={temporal_info}{Colors.RESET}"
+        )
+        video = vae_decoder.decode_tiled(
+            video_latents, tiling_config=tiling_config, debug=verbose
+        )
     else:
         print(f"{Colors.DIM}  Tiling: disabled{Colors.RESET}")
         video = vae_decoder(video_latents)
@@ -676,8 +867,8 @@ def generate_video_with_audio(
 
     # Decode audio
     print(f"{Colors.BLUE}🔊 Decoding audio...{Colors.RESET}")
-    audio_decoder = load_audio_decoder(model_path)
-    vocoder = load_vocoder(model_path)
+    audio_decoder = load_audio_decoder(model_path, use_unified=use_unified)
+    vocoder = load_vocoder(model_path, use_unified=use_unified)
     mx.eval(audio_decoder.parameters(), vocoder.parameters())
 
     mel_spectrogram = audio_decoder(audio_latents)
@@ -699,12 +890,13 @@ def generate_video_with_audio(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Save video (temporary without audio)
-    temp_video_path = output_path.with_suffix('.temp.mp4')
+    temp_video_path = output_path.with_suffix(".temp.mp4")
 
     try:
         import cv2
+
         h, w = video_np.shape[1], video_np.shape[2]
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
         out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (w, h))
         for frame in video_np:
             out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
@@ -715,7 +907,11 @@ def generate_video_with_audio(
         return None, None
 
     # Save audio
-    audio_path = output_path.with_suffix('.wav') if output_audio_path is None else Path(output_audio_path)
+    audio_path = (
+        output_path.with_suffix(".wav")
+        if output_audio_path is None
+        else Path(output_audio_path)
+    )
     save_audio(audio_np, audio_path, AUDIO_SAMPLE_RATE)
     print(f"{Colors.GREEN}✅ Saved audio to{Colors.RESET} {audio_path}")
 
@@ -727,11 +923,17 @@ def generate_video_with_audio(
     else:
         # Fallback: keep video without audio
         temp_video_path.rename(output_path)
-        print(f"{Colors.YELLOW}⚠️  Saved video without audio to{Colors.RESET} {output_path}")
+        print(
+            f"{Colors.YELLOW}⚠️  Saved video without audio to{Colors.RESET} {output_path}"
+        )
 
     elapsed = time.time() - start_time
-    print(f"{Colors.BOLD}{Colors.GREEN}🎉 Done! Generated in {elapsed:.1f}s{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.GREEN}✨ Peak memory: {mx.get_peak_memory() / (1024 ** 3):.2f}GB{Colors.RESET}")
+    print(
+        f"{Colors.BOLD}{Colors.GREEN}🎉 Done! Generated in {elapsed:.1f}s{Colors.RESET}"
+    )
+    print(
+        f"{Colors.BOLD}{Colors.GREEN}✨ Peak memory: {mx.get_peak_memory() / (1024 ** 3):.2f}GB{Colors.RESET}"
+    )
 
     return video_np, audio_np
 
@@ -750,48 +952,109 @@ Examples:
   # Image-to-Video with Audio (I2V+Audio)
   python -m mlx_video.generate_av --prompt "A person dancing" --image photo.jpg
   python -m mlx_video.generate_av --prompt "Waves crashing" --image beach.png --image-strength 0.8
-        """
+        """,
     )
 
-    parser.add_argument("--prompt", "-p", type=str, required=True,
-                        help="Text description of the video/audio to generate")
-    parser.add_argument("--height", "-H", type=int, default=512,
-                        help="Output video height (default: 512)")
-    parser.add_argument("--width", "-W", type=int, default=512,
-                        help="Output video width (default: 512)")
-    parser.add_argument("--num-frames", "-n", type=int, default=65,
-                        help="Number of frames (default: 65)")
-    parser.add_argument("--seed", "-s", type=int, default=42,
-                        help="Random seed (default: 42)")
-    parser.add_argument("--fps", type=int, default=24,
-                        help="Frames per second (default: 24)")
-    parser.add_argument("--output-path", type=str, default="output_av.mp4",
-                        help="Output video path (default: output_av.mp4)")
-    parser.add_argument("--output-audio", type=str, default=None,
-                        help="Output audio path (default: same as video with .wav)")
-    parser.add_argument("--model-repo", type=str, default="Lightricks/LTX-2",
-                        help="Model repository (default: Lightricks/LTX-2)")
-    parser.add_argument("--text-encoder-repo", type=str, default=None,
-                        help="Text encoder repository")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Verbose output")
-    parser.add_argument("--enhance-prompt", action="store_true",
-                        help="Enhance prompt using Gemma")
-    parser.add_argument("--max-tokens", type=int, default=512,
-                        help="Max tokens for prompt enhancement")
-    parser.add_argument("--temperature", type=float, default=0.7,
-                        help="Temperature for prompt enhancement")
-    parser.add_argument("--image", "-i", type=str, default=None,
-                        help="Path to conditioning image for I2V (Image-to-Video) generation")
-    parser.add_argument("--image-strength", type=float, default=1.0,
-                        help="Conditioning strength for I2V (1.0 = full denoise, 0.0 = keep original, default: 1.0)")
-    parser.add_argument("--image-frame-idx", type=int, default=0,
-                        help="Frame index to condition for I2V (0 = first frame, default: 0)")
-    parser.add_argument("--tiling", type=str, default="auto",
-                        choices=["auto", "none", "default", "aggressive", "conservative", "spatial", "temporal"],
-                        help="Tiling mode for VAE decoding (default: auto). "
-                             "auto=based on size, none=disabled, default=512px/64f, "
-                             "aggressive=256px/32f (lowest memory), conservative=768px/96f")
+    parser.add_argument(
+        "--prompt",
+        "-p",
+        type=str,
+        required=True,
+        help="Text description of the video/audio to generate",
+    )
+    parser.add_argument(
+        "--height",
+        "-H",
+        type=int,
+        default=512,
+        help="Output video height (default: 512)",
+    )
+    parser.add_argument(
+        "--width", "-W", type=int, default=512, help="Output video width (default: 512)"
+    )
+    parser.add_argument(
+        "--num-frames",
+        "-n",
+        type=int,
+        default=65,
+        help="Number of frames (default: 65)",
+    )
+    parser.add_argument(
+        "--seed", "-s", type=int, default=42, help="Random seed (default: 42)"
+    )
+    parser.add_argument(
+        "--fps", type=int, default=24, help="Frames per second (default: 24)"
+    )
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        default="output_av.mp4",
+        help="Output video path (default: output_av.mp4)",
+    )
+    parser.add_argument(
+        "--output-audio",
+        type=str,
+        default=None,
+        help="Output audio path (default: same as video with .wav)",
+    )
+    parser.add_argument(
+        "--model-repo",
+        type=str,
+        default="Lightricks/LTX-2",
+        help="Model repository (default: Lightricks/LTX-2)",
+    )
+    parser.add_argument(
+        "--text-encoder-repo", type=str, default=None, help="Text encoder repository"
+    )
+    parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--enhance-prompt", action="store_true", help="Enhance prompt using Gemma"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=512, help="Max tokens for prompt enhancement"
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Temperature for prompt enhancement",
+    )
+    parser.add_argument(
+        "--image",
+        "-i",
+        type=str,
+        default=None,
+        help="Path to conditioning image for I2V (Image-to-Video) generation",
+    )
+    parser.add_argument(
+        "--image-strength",
+        type=float,
+        default=1.0,
+        help="Conditioning strength for I2V (1.0 = full denoise, 0.0 = keep original, default: 1.0)",
+    )
+    parser.add_argument(
+        "--image-frame-idx",
+        type=int,
+        default=0,
+        help="Frame index to condition for I2V (0 = first frame, default: 0)",
+    )
+    parser.add_argument(
+        "--tiling",
+        type=str,
+        default="auto",
+        choices=[
+            "auto",
+            "none",
+            "default",
+            "aggressive",
+            "conservative",
+            "spatial",
+            "temporal",
+        ],
+        help="Tiling mode for VAE decoding (default: auto). "
+        "auto=based on size, none=disabled, default=512px/64f, "
+        "aggressive=256px/32f (lowest memory), conservative=768px/96f",
+    )
 
     args = parser.parse_args()
 

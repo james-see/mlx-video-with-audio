@@ -24,7 +24,7 @@ def get_model_path(
     Returns:
         Path to model directory
     """
-    model_path = Path(path_or_hf_repo)
+    model_path = Path(path_or_hf_repo).expanduser()
 
     if model_path.exists():
         return model_path
@@ -60,11 +60,25 @@ def load_safetensors(path: Path) -> Dict[str, mx.array]:
         # Single file - use mx.load directly (handles bfloat16)
         return mx.load(str(path))
     else:
-        # Directory - load all safetensors files
+        # Directory - load only the main model file (not quantized versions)
+        # Priority: distilled > dev (skip fp4/fp8/lora variants)
+        main_files = [
+            path / "ltx-2-19b-distilled.safetensors",
+            path / "ltx-2-19b-dev.safetensors",
+        ]
+        for main_file in main_files:
+            if main_file.exists():
+                print(f"  Loading from {main_file.name}")
+                return mx.load(str(main_file))
+
+        # Fallback: load first non-quantized safetensors file
         safetensor_files = list(path.glob("*.safetensors"))
         for sf_path in safetensor_files:
-            file_weights = mx.load(str(sf_path))
-            weights.update(file_weights)
+            # Skip quantized and lora variants
+            if any(x in sf_path.name for x in ["-fp4", "-fp8", "-lora"]):
+                continue
+            print(f"  Loading from {sf_path.name}")
+            return mx.load(str(sf_path))
 
     return weights
 
@@ -513,10 +527,16 @@ def create_model_from_config(config: Dict[str, Any]) -> LTXModel:
         audio_out_channels=config.get("audio_out_channels", 128),
         audio_cross_attention_dim=config.get("audio_cross_attention_dim", 2048),
         positional_embedding_theta=config.get("positional_embedding_theta", 10000.0),
-        positional_embedding_max_pos=config.get("positional_embedding_max_pos", [20, 2048, 2048]),
-        audio_positional_embedding_max_pos=config.get("audio_positional_embedding_max_pos", [20]),
+        positional_embedding_max_pos=config.get(
+            "positional_embedding_max_pos", [20, 2048, 2048]
+        ),
+        audio_positional_embedding_max_pos=config.get(
+            "audio_positional_embedding_max_pos", [20]
+        ),
         timestep_scale_multiplier=config.get("timestep_scale_multiplier", 1000),
-        av_ca_timestep_scale_multiplier=config.get("av_ca_timestep_scale_multiplier", 1000),
+        av_ca_timestep_scale_multiplier=config.get(
+            "av_ca_timestep_scale_multiplier", 1000
+        ),
         norm_eps=config.get("norm_eps", 1e-6),
     )
 
@@ -530,8 +550,16 @@ def convert(
     quantize: bool = False,
     q_bits: int = 4,
     q_group_size: int = 64,
+    include_audio: bool = True,
 ) -> Path:
-    """Convert HuggingFace model to MLX format.
+    """Convert HuggingFace LTX-2 model to MLX format.
+
+    Creates a unified model file containing:
+    - Transformer weights (video + audio paths)
+    - Video VAE decoder weights
+    - Video VAE encoder weights
+    - Audio VAE decoder weights (if include_audio=True)
+    - Vocoder weights (if include_audio=True)
 
     Args:
         hf_path: HuggingFace model path or repo ID
@@ -540,6 +568,7 @@ def convert(
         quantize: Whether to quantize the model
         q_bits: Quantization bits
         q_group_size: Quantization group size
+        include_audio: Whether to include audio VAE and vocoder weights
 
     Returns:
         Path to converted model
@@ -547,16 +576,74 @@ def convert(
     print(f"Loading model from {hf_path}...")
     model_path = get_model_path(hf_path)
 
-    # Load config
-    config = load_config(model_path)
-
-    # Load weights
+    # Load all raw weights
     print("Loading weights...")
-    weights = load_safetensors(model_path)
+    raw_weights = load_safetensors(model_path)
 
-    # Sanitize weights
-    print("Sanitizing weights...")
-    weights = sanitize_weights(weights)
+    # Build unified weights dictionary with proper prefixes
+    unified_weights = {}
+
+    # 1. Sanitize and add transformer weights
+    print("Processing transformer weights...")
+    transformer_weights = sanitize_transformer_weights(raw_weights)
+    for k, v in transformer_weights.items():
+        unified_weights[f"transformer.{k}"] = v
+    print(f"  Added {len(transformer_weights)} transformer weights")
+
+    # 2. Sanitize and add VAE decoder weights
+    print("Processing VAE decoder weights...")
+    vae_decoder_weights = sanitize_vae_weights(raw_weights)
+    for k, v in vae_decoder_weights.items():
+        unified_weights[f"vae_decoder.{k}"] = v
+    print(f"  Added {len(vae_decoder_weights)} VAE decoder weights")
+
+    # 3. Sanitize and add VAE encoder weights
+    print("Processing VAE encoder weights...")
+    vae_encoder_weights = sanitize_vae_encoder_weights(raw_weights)
+    for k, v in vae_encoder_weights.items():
+        unified_weights[f"vae_encoder.{k}"] = v
+    print(f"  Added {len(vae_encoder_weights)} VAE encoder weights")
+
+    if include_audio:
+        # 4. Sanitize and add audio VAE decoder weights
+        print("Processing audio VAE decoder weights...")
+        audio_vae_weights = sanitize_audio_vae_weights(raw_weights)
+        for k, v in audio_vae_weights.items():
+            unified_weights[f"audio_vae.{k}"] = v
+        print(f"  Added {len(audio_vae_weights)} audio VAE weights")
+
+        # 5. Sanitize and add vocoder weights
+        print("Processing vocoder weights...")
+        vocoder_weights = sanitize_vocoder_weights(raw_weights)
+        for k, v in vocoder_weights.items():
+            unified_weights[f"vocoder.{k}"] = v
+        print(f"  Added {len(vocoder_weights)} vocoder weights")
+
+    # 6. Add text encoder projection weights (aggregate_embed)
+    print("Processing text encoder projection weights...")
+    text_proj_count = 0
+    for k, v in raw_weights.items():
+        if k.startswith("text_embedding_projection."):
+            new_key = k  # Keep original naming
+            unified_weights[new_key] = v
+            text_proj_count += 1
+    print(f"  Added {text_proj_count} text projection weights")
+
+    # 7. Add connector weights (video and audio embeddings connectors)
+    print("Processing connector weights...")
+    connector_count = 0
+    for k, v in raw_weights.items():
+        if "video_embeddings_connector" in k or "audio_embeddings_connector" in k:
+            # Keep under model.diffusion_model prefix for compatibility with generate_av.py
+            if k.startswith("model.diffusion_model."):
+                new_key = k.replace("model.diffusion_model.", "connector.")
+            else:
+                new_key = f"connector.{k}"
+            unified_weights[new_key] = v
+            connector_count += 1
+    print(f"  Added {connector_count} connector weights")
+
+    print(f"Total unified weights: {len(unified_weights)}")
 
     # Convert dtype if specified
     if dtype is not None:
@@ -567,9 +654,13 @@ def convert(
         }
         target_dtype = dtype_map.get(dtype, mx.float16)
         print(f"Converting to {dtype}...")
-        weights = {
-            k: v.astype(target_dtype) if v.dtype in [mx.float32, mx.float16, mx.bfloat16] else v
-            for k, v in weights.items()
+        unified_weights = {
+            k: (
+                v.astype(target_dtype)
+                if v.dtype in [mx.float32, mx.float16, mx.bfloat16]
+                else v
+            )
+            for k, v in unified_weights.items()
         }
 
     # Create output directory
@@ -578,14 +669,53 @@ def convert(
 
     # Save weights
     print(f"Saving weights to {output_path}...")
-    save_weights(output_path, weights)
+    save_weights(output_path, unified_weights)
 
-    # Save config
+    # Build and save config with audio parameters
+    config = {
+        "model_type": "AudioVideo" if include_audio else "VideoOnly",
+        # Transformer config
+        "num_attention_heads": 32,
+        "attention_head_dim": 128,
+        "in_channels": 128,
+        "out_channels": 128,
+        "num_layers": 48,
+        "cross_attention_dim": 4096,
+        "caption_channels": 3840,
+        # Audio config
+        "audio_num_attention_heads": 32,
+        "audio_attention_head_dim": 64,
+        "audio_in_channels": 128,
+        "audio_out_channels": 128,
+        "audio_cross_attention_dim": 2048,
+        # Positional embedding config
+        "positional_embedding_theta": 10000.0,
+        "positional_embedding_max_pos": [20, 2048, 2048],
+        "audio_positional_embedding_max_pos": [20],
+        # Timestep config
+        "timestep_scale_multiplier": 1000,
+        "av_ca_timestep_scale_multiplier": 1000,
+        "norm_eps": 1e-6,
+        # Audio constants
+        "audio_sample_rate": 24000,
+        "audio_latent_sample_rate": 16000,
+        "audio_hop_length": 160,
+        "audio_latent_channels": 8,
+        "audio_mel_bins": 16,
+    }
+
     config_out_path = output_path / "config.json"
     with open(config_out_path, "w") as f:
         json.dump(config, f, indent=2)
 
     print(f"Model converted successfully to {output_path}")
+    print(f"  - Transformer: {len(transformer_weights)} weights")
+    print(f"  - VAE decoder: {len(vae_decoder_weights)} weights")
+    print(f"  - VAE encoder: {len(vae_encoder_weights)} weights")
+    if include_audio:
+        print(f"  - Audio VAE: {len(audio_vae_weights)} weights")
+        print(f"  - Vocoder: {len(vocoder_weights)} weights")
+
     return output_path
 
 
@@ -596,14 +726,9 @@ def save_weights(path: Path, weights: Dict[str, mx.array]) -> None:
         path: Output directory
         weights: Dictionary of weights
     """
-    from safetensors.numpy import save_file
-    import numpy as np
-
-    # Convert to numpy for safetensors
-    np_weights = {k: np.array(v) for k, v in weights.items()}
-
-    # Save to file
-    save_file(np_weights, path / "model.safetensors")
+    # Use MLX's native save which supports bfloat16 directly
+    output_file = path / "model.safetensors"
+    mx.save_safetensors(str(output_file), weights)
 
 
 def load_model(
@@ -642,39 +767,59 @@ def load_model(
     return model
 
 
-if __name__ == "__main__":
+def main():
+    """CLI entry point for model conversion."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Convert LTX-2 model to MLX format")
+    parser = argparse.ArgumentParser(
+        description="Convert LTX-2 model to MLX format with audio support",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Convert with audio support (default)
+  python -m mlx_video.convert --hf-path Lightricks/LTX-2 --mlx-path mlx_model
+
+  # Convert video-only (no audio)
+  python -m mlx_video.convert --hf-path Lightricks/LTX-2 --mlx-path mlx_model --no-audio
+
+  # Convert with bfloat16 precision
+  python -m mlx_video.convert --hf-path Lightricks/LTX-2 --mlx-path mlx_model --dtype bfloat16
+        """,
+    )
     parser.add_argument(
         "--hf-path",
         type=str,
         default="Lightricks/LTX-2",
-        help="HuggingFace model path or repo ID",
+        help="HuggingFace model path or repo ID (default: Lightricks/LTX-2)",
     )
     parser.add_argument(
         "--mlx-path",
         type=str,
         default="mlx_model",
-        help="Output path for MLX model",
+        help="Output path for MLX model (default: mlx_model)",
     )
     parser.add_argument(
         "--dtype",
         type=str,
         choices=["float16", "float32", "bfloat16"],
-        default="float16",
-        help="Target dtype",
+        default="bfloat16",
+        help="Target dtype (default: bfloat16)",
+    )
+    parser.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="Exclude audio VAE and vocoder weights (video-only model)",
     )
     parser.add_argument(
         "--quantize",
         action="store_true",
-        help="Quantize the model",
+        help="Quantize the model (experimental)",
     )
     parser.add_argument(
         "--q-bits",
         type=int,
         default=4,
-        help="Quantization bits",
+        help="Quantization bits (default: 4)",
     )
 
     args = parser.parse_args()
@@ -685,4 +830,9 @@ if __name__ == "__main__":
         dtype=args.dtype,
         quantize=args.quantize,
         q_bits=args.q_bits,
+        include_audio=not args.no_audio,
     )
+
+
+if __name__ == "__main__":
+    main()

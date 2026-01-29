@@ -9,21 +9,39 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 from PIL import Image
 
+
 def get_model_path(model_repo: str):
-    """Get or download LTX-2 model path."""
+    """Get or download LTX-2 model path.
+
+    Args:
+        model_repo: Either a local path or a HuggingFace repo ID
+
+    Returns:
+        Path to the model directory
+    """
+    # Check if it's a local path first
+    local_path = Path(model_repo).expanduser()
+    if local_path.exists() and local_path.is_dir():
+        return local_path
+
+    # Otherwise treat as HuggingFace repo ID
     try:
         return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
     except Exception:
         print("Downloading LTX-2 model weights...")
-        return Path(snapshot_download(
-            repo_id=model_repo,
-            local_files_only=False,
-            resume_download=True,
-            allow_patterns=["*.safetensors", "*.json"],
-        ))
+        return Path(
+            snapshot_download(
+                repo_id=model_repo,
+                local_files_only=False,
+                resume_download=True,
+                allow_patterns=["*.safetensors", "*.json"],
+            )
+        )
+
 
 def apply_quantization(model: nn.Module, weights: mx.array, quantization: dict):
     if quantization is not None:
+
         def get_class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in quantization:
@@ -44,17 +62,15 @@ def apply_quantization(model: nn.Module, weights: mx.array, quantization: dict):
             class_predicate=get_class_predicate,
         )
 
-@partial(mx.compile, shapeless=True)  
+
+@partial(mx.compile, shapeless=True)
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return mx.fast.rms_norm(x, mx.ones((x.shape[-1],), dtype=x.dtype), eps)
 
 
-
 @partial(mx.compile, shapeless=True)
 def to_denoised(
-    noisy: mx.array,
-    velocity: mx.array,
-    sigma: mx.array | float
+    noisy: mx.array, velocity: mx.array, sigma: mx.array | float
 ) -> mx.array:
     """Convert velocity prediction to denoised output.
 
@@ -274,7 +290,9 @@ def prepare_image_for_encoding(
         if image_np.max() <= 1.0:
             image_np = (image_np * 255).astype(np.uint8)
         pil_image = Image.fromarray(image_np)
-        pil_image = pil_image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        pil_image = pil_image.resize(
+            (target_width, target_height), Image.Resampling.LANCZOS
+        )
         image = mx.array(np.array(pil_image).astype(np.float32) / 255.0)
 
     # Normalize to [-1, 1]

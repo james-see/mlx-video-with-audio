@@ -19,7 +19,8 @@ dependencies = [
     "tqdm",
     "opencv-python>=4.12.0.88",
     "Pillow>=10.3.0",
-    "mlx-vlm"
+    "mlx-vlm",
+    "soundfile>=0.12.0",
 ]
 license = {text="MIT"}
 authors = [
@@ -42,6 +43,8 @@ Issues = "https://github.com/Blaizzy/mlx-video/issues"
 
 [project.scripts]
 "mlx_video.generate" = "mlx_video.generate:main"
+"mlx_video.generate_av" = "mlx_video.generate_av:main"
+"mlx_video.convert" = "mlx_video.convert:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_video*"]

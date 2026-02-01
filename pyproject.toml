@@ -7,7 +7,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mlx-video-with-audio"
 dynamic = ["version"]
-description = "MLX-Video is the best package for inference and finetuning of Image-Video-Audio generation models on your Mac using MLX."
+description = "Generate videos with synchronized audio on Apple Silicon using MLX. Supports text-to-video (T2V) and image-to-video (I2V) with LTX-2."
+keywords = [
+    "mlx",
+    "video-generation",
+    "audio-generation",
+    "apple-silicon",
+    "text-to-video",
+    "image-to-video",
+    "ltx",
+    "diffusion",
+    "ai",
+    "machine-learning",
+]
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

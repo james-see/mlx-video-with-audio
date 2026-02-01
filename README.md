@@ -1,6 +1,6 @@
-# mlx-video
+# mlx-video-with-audio
 
-MLX-Video is the best package for inference and finetuning of Image-Video-Audio generation models on your Mac using MLX.
+Generate videos with synchronized audio on Apple Silicon using MLX. Supports text-to-video (T2V) and image-to-video (I2V) generation with the LTX-2 model.
 
 ## Features
 
@@ -14,16 +14,22 @@ MLX-Video is the best package for inference and finetuning of Image-Video-Audio 
 
 ## Installation
 
-### Option 1: Install with pip (requires git):
+### Install from PyPI:
 
 ```bash
-pip install git+https://github.com/Blaizzy/mlx-video.git
+pip install mlx-video-with-audio
 ```
 
-### Option 2: Install with uv (ultra-fast package manager):
+Or with uv:
 
 ```bash
-uv pip install git+https://github.com/Blaizzy/mlx-video.git
+uv pip install mlx-video-with-audio
+```
+
+### Install from source:
+
+```bash
+pip install git+https://github.com/james-see/mlx-video-with-audio.git
 ```
 
 ### Requirements
@@ -90,7 +96,7 @@ For video generation without audio:
 uv run mlx_video.generate --prompt "Two dogs of the poodle breed wearing sunglasses, close up, cinematic, sunset" -n 100 --width 768
 ```
 
-<img src="https://github.com/Blaizzy/mlx-video/raw/main/examples/poodles.gif" width="512" alt="Poodles demo">
+<img src="https://github.com/james-see/mlx-video-with-audio/raw/main/examples/poodles.gif" width="512" alt="Poodles demo">
 
 ## CLI Reference
 

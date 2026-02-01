@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "mlx-video"
+name = "mlx-video-with-audio"
 dynamic = ["version"]
 description = "MLX-Video is the best package for inference and finetuning of Image-Video-Audio generation models on your Mac using MLX."
 readme = "README.md"
@@ -37,9 +37,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Blaizzy/mlx-video"
-Repository = "https://github.com/Blaizzy/mlx-video"
-Issues = "https://github.com/Blaizzy/mlx-video/issues"
+Homepage = "https://github.com/james-see/mlx-video-with-audio"
+Repository = "https://github.com/james-see/mlx-video-with-audio"
+Issues = "https://github.com/james-see/mlx-video-with-audio/issues"
 
 [project.scripts]
 "mlx_video.generate" = "mlx_video.generate:main"

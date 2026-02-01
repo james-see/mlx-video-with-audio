@@ -1,4 +1,5 @@
 import argparse
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -123,6 +124,7 @@ def denoise(
     sigmas: list,
     verbose: bool = True,
     state: Optional[LatentState] = None,
+    stage: int = 1,
 ) -> mx.array:
     """Run denoising loop with optional conditioning.
 
@@ -134,6 +136,7 @@ def denoise(
         sigmas: List of sigma values for denoising schedule
         verbose: Whether to show progress bar
         state: Optional LatentState for I2V conditioning
+        stage: Stage number for progress logging (1 or 2)
 
     Returns:
         Denoised latent tensor
@@ -143,7 +146,10 @@ def denoise(
     if state is not None:
         latents = state.latent
 
-    for i in tqdm(range(len(sigmas) - 1), desc="Denoising", disable=not verbose):
+    total_steps = len(sigmas) - 1
+    for i in tqdm(range(total_steps), desc="Denoising", disable=not verbose):
+        # Emit structured progress for external parsers
+        print(f"STAGE:{stage}:STEP:{i + 1}:{total_steps}:Denoising", file=sys.stderr, flush=True)
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
 
         b, c, f, h, w = latents.shape
@@ -394,7 +400,7 @@ def generate_video(
         latents = mx.random.normal((1, 128, latent_frames, stage1_h, stage1_w), dtype=model_dtype)
         mx.eval(latents)
 
-    latents = denoise(latents, positions, text_embeddings, transformer, STAGE_1_SIGMAS, verbose=verbose, state=state1)
+    latents = denoise(latents, positions, text_embeddings, transformer, STAGE_1_SIGMAS, verbose=verbose, state=state1, stage=1)
 
     # Upsample latents
     print(f"{Colors.MAGENTA}🔍 Upsampling latents 2x...{Colors.RESET}")
@@ -455,7 +461,7 @@ def generate_video(
         latents = noise * noise_scale + latents * one_minus_scale
         mx.eval(latents)
 
-    latents = denoise(latents, positions, text_embeddings, transformer, STAGE_2_SIGMAS, verbose=verbose, state=state2)
+    latents = denoise(latents, positions, text_embeddings, transformer, STAGE_2_SIGMAS, verbose=verbose, state=state2, stage=2)
 
     del transformer
     mx.clear_cache()

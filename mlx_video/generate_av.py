@@ -1,6 +1,7 @@
 """Audio-Video generation pipeline for LTX-2."""
 
 import argparse
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -193,6 +194,7 @@ def denoise_av(
     sigmas: list,
     verbose: bool = True,
     video_state: Optional[LatentState] = None,
+    stage: int = 1,
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for audio-video generation with optional I2V conditioning.
 
@@ -207,6 +209,7 @@ def denoise_av(
         sigmas: List of sigma values
         verbose: Whether to show progress bar
         video_state: Optional LatentState for I2V conditioning
+        stage: Stage number for progress logging (1 or 2)
 
     Returns:
         Tuple of (video_latents, audio_latents)
@@ -216,7 +219,10 @@ def denoise_av(
     if video_state is not None:
         video_latents = video_state.latent
 
-    for i in tqdm(range(len(sigmas) - 1), desc="Denoising A/V", disable=not verbose):
+    total_steps = len(sigmas) - 1
+    for i in tqdm(range(total_steps), desc="Denoising A/V", disable=not verbose):
+        # Emit structured progress for external parsers
+        print(f"STAGE:{stage}:STEP:{i + 1}:{total_steps}:Denoising", file=sys.stderr, flush=True)
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
 
         # Flatten video latents
@@ -718,6 +724,7 @@ def generate_video_with_audio(
         STAGE_1_SIGMAS,
         verbose=verbose,
         video_state=video_state1,
+        stage=1,
     )
 
     # Upsample video latents
@@ -807,6 +814,7 @@ def generate_video_with_audio(
         STAGE_2_SIGMAS,
         verbose=verbose,
         video_state=video_state2,
+        stage=2,
     )
 
     del transformer

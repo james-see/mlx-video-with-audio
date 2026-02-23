@@ -55,6 +55,7 @@ def enhance_with_model(
     """
     try:
         from mlx_lm import load, generate
+        from mlx_lm.sample_utils import make_sampler
     except ImportError:
         print(
             "mlx-lm not available for uncensored enhancement. Using original prompt.",
@@ -78,12 +79,14 @@ def enhance_with_model(
 
     mx.random.seed(seed)
 
+    # mlx-lm 0.25+ uses sampler instead of temp kwarg (generate_step rejects temp)
+    sampler = make_sampler(temperature, 1.0, 0.0, 1, top_k=0)
     response = generate(
         model,
         tokenizer,
         prompt=formatted,
         max_tokens=max_tokens,
-        temp=temperature,
+        sampler=sampler,
         verbose=verbose,
     )
 

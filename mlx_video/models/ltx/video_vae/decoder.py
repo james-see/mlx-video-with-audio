@@ -76,16 +76,14 @@ class PixArtAlphaTimestepEmbedder(nn.Module):
     def __init__(self, embedding_dim: int):
         super().__init__()
         self.timestep_embedder = TimestepEmbedding(
-            in_channels=256,
-            time_embed_dim=embedding_dim
+            in_channels=256, time_embed_dim=embedding_dim
         )
 
-    def __call__(self, timestep: mx.array, hidden_dtype: mx.Dtype = mx.float32) -> mx.array:
+    def __call__(
+        self, timestep: mx.array, hidden_dtype: mx.Dtype = mx.float32
+    ) -> mx.array:
         timesteps_proj = get_timestep_embedding(
-            timestep,
-            embedding_dim=256,
-            flip_sin_to_cos=True,
-            downscale_freq_shift=0
+            timestep, embedding_dim=256, flip_sin_to_cos=True, downscale_freq_shift=0
         )
         timesteps_emb = self.timestep_embedder(timesteps_proj.astype(hidden_dtype))
         return timesteps_emb
@@ -118,6 +116,7 @@ class ResnetBlock3DSimple(nn.Module):
 
     def _make_conv_wrapper(self, in_ch, out_ch, padding_mode):
         """Create a wrapper object with a 'conv' attribute to match PyTorch naming."""
+
         class ConvWrapper(nn.Module):
             def __init__(self_inner):
                 super().__init__()
@@ -129,13 +128,15 @@ class ResnetBlock3DSimple(nn.Module):
                     padding=1,
                     spatial_padding_mode=padding_mode,
                 )
+
             def __call__(self_inner, x, causal=False):
                 return self_inner.conv(x, causal=causal)
+
         return ConvWrapper()
 
     def pixel_norm(self, x: mx.array, eps: float = 1e-8) -> mx.array:
         """Apply pixel normalization."""
-        return x / mx.sqrt(mx.mean(x ** 2, axis=1, keepdims=True) + eps)
+        return x / mx.sqrt(mx.mean(x**2, axis=1, keepdims=True) + eps)
 
     def __call__(
         self,
@@ -152,7 +153,9 @@ class ResnetBlock3DSimple(nn.Module):
         if self.timestep_conditioning and timestep_embed is not None:
             # scale_shift_table: (4, C), timestep_embed: (B, 4*C, 1, 1, 1)
             # Combine table with timestep embedding
-            ada_values = self.scale_shift_table[None, :, :, None, None, None]  # (1, 4, C, 1, 1, 1)
+            ada_values = self.scale_shift_table[
+                None, :, :, None, None, None
+            ]  # (1, 4, C, 1, 1, 1)
             # Reshape timestep_embed from (B, 4*C, 1, 1, 1) to (B, 4, C, 1, 1, 1)
             channels = self.scale_shift_table.shape[1]
             ts_reshaped = timestep_embed.reshape(batch_size, 4, channels, 1, 1, 1)
@@ -198,16 +201,14 @@ class ResBlockGroup(nn.Module):
 
         # Time embedder for this block group: embed_dim = 4 * channels
         if timestep_conditioning:
-            self.time_embedder = PixArtAlphaTimestepEmbedder(
-                embedding_dim=channels * 4
-            )
+            self.time_embedder = PixArtAlphaTimestepEmbedder(embedding_dim=channels * 4)
 
         # Use dict with int keys for MLX to track parameters properly
         self.res_blocks = {
             i: ResnetBlock3DSimple(
                 channels,
                 spatial_padding_mode,
-                timestep_conditioning=timestep_conditioning
+                timestep_conditioning=timestep_conditioning,
             )
             for i in range(num_layers)
         }
@@ -223,8 +224,7 @@ class ResBlockGroup(nn.Module):
         if self.timestep_conditioning and timestep is not None:
             batch_size = x.shape[0]
             timestep_embed = self.time_embedder(
-                timestep.flatten(),
-                hidden_dtype=x.dtype
+                timestep.flatten(), hidden_dtype=x.dtype
             )
             # Reshape to (B, 4*C, 1, 1, 1) for broadcasting
             timestep_embed = timestep_embed.reshape(batch_size, -1, 1, 1, 1)
@@ -284,14 +284,18 @@ class LTX2VideoDecoder(nn.Module):
                     padding=1,
                     spatial_padding_mode=spatial_padding_mode,
                 )
+
             def __call__(self_inner, x, causal=False):
                 return self_inner.conv(x, causal=causal)
+
         self.conv_in = ConvInWrapper()
 
         # Up blocks: alternating ResBlockGroup and DepthToSpaceUpsample
         # Use dict with int keys for MLX to track parameters properly
         self.up_blocks = {
-            0: ResBlockGroup(1024, num_layers_per_block, spatial_padding_mode, timestep_conditioning),
+            0: ResBlockGroup(
+                1024, num_layers_per_block, spatial_padding_mode, timestep_conditioning
+            ),
             1: DepthToSpaceUpsample(
                 dims=3,
                 in_channels=1024,
@@ -300,7 +304,9 @@ class LTX2VideoDecoder(nn.Module):
                 out_channels_reduction_factor=2,
                 spatial_padding_mode=spatial_padding_mode,
             ),
-            2: ResBlockGroup(512, num_layers_per_block, spatial_padding_mode, timestep_conditioning),
+            2: ResBlockGroup(
+                512, num_layers_per_block, spatial_padding_mode, timestep_conditioning
+            ),
             3: DepthToSpaceUpsample(
                 dims=3,
                 in_channels=512,
@@ -309,7 +315,9 @@ class LTX2VideoDecoder(nn.Module):
                 out_channels_reduction_factor=2,
                 spatial_padding_mode=spatial_padding_mode,
             ),
-            4: ResBlockGroup(256, num_layers_per_block, spatial_padding_mode, timestep_conditioning),
+            4: ResBlockGroup(
+                256, num_layers_per_block, spatial_padding_mode, timestep_conditioning
+            ),
             5: DepthToSpaceUpsample(
                 dims=3,
                 in_channels=256,
@@ -318,10 +326,13 @@ class LTX2VideoDecoder(nn.Module):
                 out_channels_reduction_factor=2,
                 spatial_padding_mode=spatial_padding_mode,
             ),
-            6: ResBlockGroup(128, num_layers_per_block, spatial_padding_mode, timestep_conditioning),
+            6: ResBlockGroup(
+                128, num_layers_per_block, spatial_padding_mode, timestep_conditioning
+            ),
         }
 
         final_out_channels = out_channels * patch_size * patch_size
+
         class ConvOutWrapper(nn.Module):
             def __init__(self_inner):
                 super().__init__()
@@ -333,8 +344,10 @@ class LTX2VideoDecoder(nn.Module):
                     padding=1,
                     spatial_padding_mode=spatial_padding_mode,
                 )
+
             def __call__(self_inner, x, causal=False):
                 return self_inner.conv(x, causal=causal)
+
         self.conv_out = ConvOutWrapper()
 
         self.act = nn.SiLU()
@@ -356,7 +369,7 @@ class LTX2VideoDecoder(nn.Module):
 
     def pixel_norm(self, x: mx.array, eps: float = 1e-8) -> mx.array:
         """Apply pixel normalization."""
-        return x / mx.sqrt(mx.mean(x ** 2, axis=1, keepdims=True) + eps)
+        return x / mx.sqrt(mx.mean(x**2, axis=1, keepdims=True) + eps)
 
     def __call__(
         self,
@@ -366,11 +379,13 @@ class LTX2VideoDecoder(nn.Module):
         debug: bool = False,
         chunked_conv: bool = False,
     ) -> mx.array:
-       
+
         def debug_stats(name, t):
             if debug:
                 mx.eval(t)
-                print(f"  [VAE] {name}: shape={t.shape}, min={t.min().item():.4f}, max={t.max().item():.4f}, mean={t.mean().item():.4f}")
+                print(
+                    f"  [VAE] {name}: shape={t.shape}, min={t.min().item():.4f}, max={t.max().item():.4f}, mean={t.mean().item():.4f}"
+                )
 
         batch_size = sample.shape[0]
 
@@ -385,7 +400,9 @@ class LTX2VideoDecoder(nn.Module):
                 debug_stats("After noise", sample)
 
         if debug:
-            print(f"  [VAE] Denorm stats - mean: [{self.latents_mean.min().item():.4f}, {self.latents_mean.max().item():.4f}], std: [{self.latents_std.min().item():.4f}, {self.latents_std.max().item():.4f}]")
+            print(
+                f"  [VAE] Denorm stats - mean: [{self.latents_mean.min().item():.4f}, {self.latents_mean.max().item():.4f}], std: [{self.latents_std.min().item():.4f}, {self.latents_std.max().item():.4f}]"
+            )
         sample = self.denormalize(sample)
         if debug:
             debug_stats("After denormalize", sample)
@@ -418,12 +435,13 @@ class LTX2VideoDecoder(nn.Module):
 
         if self.timestep_conditioning and scaled_timestep is not None:
             embedded_timestep = self.last_time_embedder(
-                scaled_timestep.flatten(),
-                hidden_dtype=x.dtype
+                scaled_timestep.flatten(), hidden_dtype=x.dtype
             )
             embedded_timestep = embedded_timestep.reshape(batch_size, -1, 1, 1, 1)
 
-            ada_values = self.last_scale_shift_table[None, :, :, None, None, None]  # (1, 2, 128, 1, 1, 1)
+            ada_values = self.last_scale_shift_table[
+                None, :, :, None, None, None
+            ]  # (1, 2, 128, 1, 1, 1)
             ts_reshaped = embedded_timestep.reshape(batch_size, 2, 128, 1, 1, 1)
             ada_values = ada_values + ts_reshaped
 
@@ -502,11 +520,23 @@ class LTX2VideoDecoder(nn.Module):
 
         # Auto-enable chunked conv for modes where it helps (larger tiles)
         # Chunked conv reduces memory by processing conv+depth_to_space in temporal chunks
-        use_chunked_conv = tiling_mode in ("conservative", "none", "auto", "default", "spatial")
+        use_chunked_conv = tiling_mode in (
+            "conservative",
+            "none",
+            "auto",
+            "default",
+            "spatial",
+        )
 
         if not needs_spatial_tiling and not needs_temporal_tiling:
             # No tiling needed, use regular decode
-            return self(sample, causal=causal, timestep=timestep, debug=debug, chunked_conv=use_chunked_conv)
+            return self(
+                sample,
+                causal=causal,
+                timestep=timestep,
+                debug=debug,
+                chunked_conv=use_chunked_conv,
+            )
 
         return decode_with_tiling(
             decoder_fn=self,
@@ -521,22 +551,34 @@ class LTX2VideoDecoder(nn.Module):
         )
 
 
-def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = None) -> LTX2VideoDecoder:
+def load_vae_decoder(
+    model_path: str,
+    timestep_conditioning: Optional[bool] = None,
+    use_unified: bool = False,
+) -> LTX2VideoDecoder:
     from pathlib import Path
     import json
     from safetensors import safe_open
 
     model_path = Path(model_path)
 
-    # Try to find the weights file
-    if model_path.is_file() and model_path.suffix == ".safetensors":
-        weights_path = model_path
-    elif (model_path / "ltx-2-19b-distilled.safetensors").exists():
-        weights_path = model_path / "ltx-2-19b-distilled.safetensors"
-    elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
-        weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
+    # Unified MLX format: model.safetensors with vae_decoder. prefix
+    if use_unified and (model_path / "model.safetensors").exists():
+        weights_path = model_path / "model.safetensors"
+        unified_prefix = "vae_decoder."
     else:
-        raise FileNotFoundError(f"VAE weights not found at {model_path}")
+        unified_prefix = None
+
+    if unified_prefix is None:
+        # Try to find the weights file
+        if model_path.is_file() and model_path.suffix == ".safetensors":
+            weights_path = model_path
+        elif (model_path / "ltx-2-19b-distilled.safetensors").exists():
+            weights_path = model_path / "ltx-2-19b-distilled.safetensors"
+        elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
+            weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
+        else:
+            raise FileNotFoundError(f"VAE weights not found at {model_path}")
 
     print(f"Loading VAE decoder from {weights_path}...")
 
@@ -548,36 +590,52 @@ def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = No
                 if metadata and "config" in metadata:
                     configs = json.loads(metadata["config"])
                     vae_config = configs.get("vae", {})
-                    timestep_conditioning = vae_config.get("timestep_conditioning", False)
-                    print(f"  Auto-detected timestep_conditioning={timestep_conditioning} from weights")
+                    timestep_conditioning = vae_config.get(
+                        "timestep_conditioning", False
+                    )
+                    print(
+                        f"  Auto-detected timestep_conditioning={timestep_conditioning} from weights"
+                    )
                 else:
                     timestep_conditioning = False
         except Exception as e:
-            print(f"  Could not read config from metadata: {e}, defaulting to timestep_conditioning=False")
+            print(
+                f"  Could not read config from metadata: {e}, defaulting to timestep_conditioning=False"
+            )
             timestep_conditioning = False
 
     decoder = LTX2VideoDecoder(timestep_conditioning=timestep_conditioning)
 
     weights = mx.load(str(weights_path))
 
+    # Filter by unified prefix if loading from unified model
+    if unified_prefix:
+        weights = {k: v for k, v in weights.items() if k.startswith(unified_prefix)}
+
     # Determine prefix based on weight keys
+    has_vae_decoder_prefix = any(k.startswith("vae_decoder.") for k in weights.keys())
     has_vae_prefix = any(k.startswith("vae.") for k in weights.keys())
     has_decoder_prefix = any(k.startswith("decoder.") for k in weights.keys())
 
-    if has_vae_prefix:
+    if has_vae_decoder_prefix:
+        prefix = "vae_decoder."
+        mean_key = "vae_decoder.per_channel_statistics.mean"
+        std_key = "vae_decoder.per_channel_statistics.std"
+    elif has_vae_prefix:
         prefix = "vae.decoder."
         stats_prefix = "vae.per_channel_statistics."
+        mean_key = f"{stats_prefix}mean-of-means"
+        std_key = f"{stats_prefix}std-of-means"
     elif has_decoder_prefix:
         prefix = "decoder."
         stats_prefix = ""
+        mean_key = "latents_mean"
+        std_key = "latents_std"
     else:
         prefix = ""
         stats_prefix = ""
-
-    # Load per-channel statistics for denormalization
-    # Note: use std-of-means (not mean-of-stds) for proper denormalization
-    mean_key = f"{stats_prefix}mean-of-means" if stats_prefix else "latents_mean"
-    std_key = f"{stats_prefix}std-of-means" if stats_prefix else "latents_std"
+        mean_key = "latents_mean"
+        std_key = "latents_std"
 
     if mean_key in weights:
         decoder.latents_mean = weights[mean_key]
@@ -591,9 +649,12 @@ def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = No
     for key, value in weights.items():
         if not key.startswith(prefix):
             continue
+        # Skip per_channel_statistics - loaded into latents_mean/latents_std above
+        if "per_channel_statistics" in key:
+            continue
 
         # Remove prefix
-        new_key = key[len(prefix):]
+        new_key = key[len(prefix) :]
 
         # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
         if ".conv.weight" in key and value.ndim == 5:
@@ -601,7 +662,6 @@ def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = No
         if ".conv.bias" in key:
             pass  # bias doesn't need transpose
 
-       
         if ".conv.weight" in new_key or ".conv.bias" in new_key:
             if ".conv.conv.weight" not in new_key and ".conv.conv.bias" not in new_key:
                 new_key = new_key.replace(".conv.weight", ".conv.conv.weight")
@@ -611,7 +671,11 @@ def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = No
 
     print(f"  Found {len(decoder_weights)} decoder weights")
 
-    ts_keys = [k for k in decoder_weights.keys() if "scale_shift" in k or "time_embedder" in k or "timestep_scale" in k]
+    ts_keys = [
+        k
+        for k in decoder_weights.keys()
+        if "scale_shift" in k or "time_embedder" in k or "timestep_scale" in k
+    ]
     print(f"  Found {len(ts_keys)} timestep conditioning weights")
 
     # Load weights

@@ -36,11 +36,20 @@ class Conv3d(nn.Module):
         self.groups = groups
 
         # Weight shape: (C_out, KD, KH, KW, C_in)
-        scale = 1.0 / (in_channels * kernel_size[0] * kernel_size[1] * kernel_size[2]) ** 0.5
+        scale = (
+            1.0
+            / (in_channels * kernel_size[0] * kernel_size[1] * kernel_size[2]) ** 0.5
+        )
         self.weight = mx.random.uniform(
             low=-scale,
             high=scale,
-            shape=(out_channels, kernel_size[0], kernel_size[1], kernel_size[2], in_channels),
+            shape=(
+                out_channels,
+                kernel_size[0],
+                kernel_size[1],
+                kernel_size[2],
+                in_channels,
+            ),
         )
 
         if bias:
@@ -86,7 +95,6 @@ class GroupNorm3d(nn.Module):
         # x: (N, D, H, W, C)
         n, d, h, w, c = x.shape
         input_dtype = x.dtype
-
 
         x = x.astype(mx.float32)
 
@@ -201,7 +209,6 @@ class ResBlock3D(nn.Module):
 
 class LatentUpsampler(nn.Module):
 
-
     def __init__(
         self,
         in_channels: int = 128,
@@ -218,13 +225,17 @@ class LatentUpsampler(nn.Module):
         self.initial_norm = GroupNorm3d(32, mid_channels)
 
         # Pre-upsample ResBlocks - use dict with int keys for MLX parameter tracking
-        self.res_blocks = {i: ResBlock3D(mid_channels) for i in range(num_blocks_per_stage)}
+        self.res_blocks = {
+            i: ResBlock3D(mid_channels) for i in range(num_blocks_per_stage)
+        }
 
         # Upsampler: 2D spatial upsampling (frame-by-frame)
         self.upsampler = SpatialRationalResampler(mid_channels=mid_channels, scale=2.0)
 
         # Post-upsample ResBlocks - use dict with int keys for MLX parameter tracking
-        self.post_upsample_res_blocks = {i: ResBlock3D(mid_channels) for i in range(num_blocks_per_stage)}
+        self.post_upsample_res_blocks = {
+            i: ResBlock3D(mid_channels) for i in range(num_blocks_per_stage)
+        }
 
         # Final projection
         self.final_conv = Conv3d(mid_channels, in_channels, kernel_size=3, padding=1)
@@ -239,10 +250,13 @@ class LatentUpsampler(nn.Module):
         Returns:
             Upsampled tensor of shape (B, C, F, H*2, W*2) - channels first
         """
+
         def debug_stats(name, t):
             if debug:
                 mx.eval(t)
-                print(f"    {name}: shape={t.shape}, min={t.min().item():.4f}, max={t.max().item():.4f}, mean={t.mean().item():.4f}")
+                print(
+                    f"    {name}: shape={t.shape}, min={t.min().item():.4f}, max={t.max().item():.4f}, mean={t.mean().item():.4f}"
+                )
 
         if debug:
             print("  [DEBUG] LatentUpsampler forward pass:")
@@ -306,33 +320,59 @@ def upsample_latents(
     latent_mean = latent_mean.reshape(1, -1, 1, 1, 1)
     latent_std = latent_std.reshape(1, -1, 1, 1, 1)
     latent = latent * latent_std + latent_mean
-   
+
     # Upsample
     latent = upsampler(latent, debug=debug)
-   
+
     # Re-normalize: (latent - mean) / std
     latent = (latent - latent_mean) / latent_std
 
     return latent
 
 
-def load_upsampler(weights_path: str) -> LatentUpsampler:
+def load_upsampler(weights_path: str, use_unified: bool = False) -> LatentUpsampler:
     """Load upsampler from safetensors weights.
 
     Args:
-        weights_path: Path to upsampler weights file
+        weights_path: Path to upsampler weights file or model directory (when use_unified)
+        use_unified: If True, load from model.safetensors with upsampler. prefix.
+                     If upsampler not in unified model, falls back to Lightricks (upsampler only, ~1GB).
 
     Returns:
         Loaded LatentUpsampler model
     """
-    print(f"Loading spatial upsampler from {weights_path}...")
-    raw_weights = mx.load(weights_path)
+    from pathlib import Path
+
+    path = Path(weights_path)
+    if use_unified and path.is_dir() and (path / "model.safetensors").exists():
+        all_weights = mx.load(str(path / "model.safetensors"))
+        raw_weights = {
+            k: v for k, v in all_weights.items() if k.startswith("upsampler.")
+        }
+        if not raw_weights:
+            # Fallback: download just upsampler from Lightricks (~1GB, not full 150GB)
+            from huggingface_hub import hf_hub_download
+
+            print(
+                "  Upsampler not in unified model, downloading from Lightricks (~1GB)..."
+            )
+            upsampler_file = hf_hub_download(
+                repo_id="Lightricks/LTX-2",
+                filename="ltx-2-spatial-upscaler-x2-1.0.safetensors",
+            )
+            raw_weights = mx.load(upsampler_file)
+    else:
+        print(f"Loading spatial upsampler from {weights_path}...")
+        raw_weights = mx.load(weights_path)
 
     # Check weight shapes to determine mid_channels
     # res_blocks.0.conv1.weight should be (mid_channels, mid_channels, 3, 3, 3)
     sample_key = "res_blocks.0.conv1.weight"
+    sample_key_prefixed = "upsampler.res_blocks.0.conv1.weight"
     if sample_key in raw_weights:
         mid_channels = raw_weights[sample_key].shape[0]
+    elif sample_key_prefixed in raw_weights:
+        mid_channels = raw_weights[sample_key_prefixed].shape[0]
     else:
         mid_channels = 1024  # default
 

@@ -1,5 +1,3 @@
-
-
 import functools
 import logging
 import math
@@ -34,11 +32,10 @@ def _load_system_prompt(prompt_name: str) -> str:
 
 class LanguageModel(nn.Module):
 
-
     def __init__(self, config: TextConfig):
         super().__init__()
         # Create config matching LTX-2 text encoder requirements
-        self.config = config 
+        self.config = config
 
         # Create the Gemma3Model from mlx-vlm
         self.model = Gemma3Model(self.config)
@@ -49,7 +46,7 @@ class LanguageModel(nn.Module):
         attention_mask: Optional[mx.array],
         dtype: mx.Dtype,
     ) -> mx.array:
-        
+
         causal_mask = mx.tril(mx.ones((seq_len, seq_len), dtype=mx.bool_))
 
         if attention_mask is not None:
@@ -57,15 +54,25 @@ class LanguageModel(nn.Module):
 
             padding_mask = attention_mask.astype(mx.bool_)  # (batch, seq_len)
             combined = causal_mask[None, :, :] & padding_mask[:, None, :]
-            min_val = mx.finfo(dtype).min if dtype in (mx.float16, mx.bfloat16) else -1e9
-            mask = mx.where(combined, mx.zeros(combined.shape, dtype=dtype),
-                           mx.full(combined.shape, min_val, dtype=dtype))
+            min_val = (
+                mx.finfo(dtype).min if dtype in (mx.float16, mx.bfloat16) else -1e9
+            )
+            mask = mx.where(
+                combined,
+                mx.zeros(combined.shape, dtype=dtype),
+                mx.full(combined.shape, min_val, dtype=dtype),
+            )
             return mask[:, None, :, :]
         else:
             # No padding mask, just causal
-            min_val = mx.finfo(dtype).min if dtype in (mx.float16, mx.bfloat16) else -1e9
-            mask = mx.where(causal_mask, mx.zeros((seq_len, seq_len), dtype=dtype),
-                           mx.full((seq_len, seq_len), min_val, dtype=dtype))
+            min_val = (
+                mx.finfo(dtype).min if dtype in (mx.float16, mx.bfloat16) else -1e9
+            )
+            mask = mx.where(
+                causal_mask,
+                mx.zeros((seq_len, seq_len), dtype=dtype),
+                mx.full((seq_len, seq_len), min_val, dtype=dtype),
+            )
             return mask[None, None, :, :]  # (1, 1, seq, seq)
 
     def __call__(
@@ -89,7 +96,11 @@ class LanguageModel(nn.Module):
         batch_size, seq_len = inputs.shape
 
         # Get embeddings
-        h = input_embeddings if input_embeddings is not None else self.model.embed_tokens(inputs)
+        h = (
+            input_embeddings
+            if input_embeddings is not None
+            else self.model.embed_tokens(inputs)
+        )
 
         # Apply Gemma scaling
         h *= mx.array(self.config.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
@@ -101,10 +112,11 @@ class LanguageModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.model.layers)
 
-        full_causal_mask = self._create_causal_mask_with_padding(seq_len, attention_mask, h.dtype)
+        full_causal_mask = self._create_causal_mask_with_padding(
+            seq_len, attention_mask, h.dtype
+        )
 
         sliding_mask = full_causal_mask
-
 
         num_layers = len(self.model.layers)
         for i, layer in enumerate(self.model.layers):
@@ -145,9 +157,9 @@ class LanguageModel(nn.Module):
         for key, value in weights.items():
             if key.startswith(prefix):
                 if hasattr(value, "dtype") and value.dtype == mx.float32:
-                    sanitized[key[len(prefix):]] = value.astype(mx.bfloat16)
+                    sanitized[key[len(prefix) :]] = value.astype(mx.bfloat16)
                 else:
-                    sanitized[key[len(prefix):]] = value
+                    sanitized[key[len(prefix) :]] = value
         return sanitized
 
     @property
@@ -156,6 +168,7 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         from mlx_vlm.models.cache import KVCache, RotatingKVCache
+
         caches = []
         for i in range(len(self.layers)):
             if (
@@ -170,6 +183,7 @@ class LanguageModel(nn.Module):
     @classmethod
     def from_pretrained(cls, model_path: str):
         import json
+
         weight_files = sorted(Path(model_path).glob("*.safetensors"))
         config_file = Path(model_path) / "config.json"
         config_dict = {}
@@ -177,7 +191,9 @@ class LanguageModel(nn.Module):
             with open(config_file, "r") as f:
                 config_dict = json.load(f)
 
-            language_model = cls(config=TextConfig.from_dict(config_dict["text_config"]))
+            language_model = cls(
+                config=TextConfig.from_dict(config_dict["text_config"])
+            )
         else:
             raise ValueError(f"Config file not found at {model_path}")
 
@@ -186,17 +202,16 @@ class LanguageModel(nn.Module):
         for i, wf in enumerate(weight_files):
             weights.update(mx.load(str(wf)))
 
-
         if hasattr(language_model, "sanitize"):
             weights = language_model.sanitize(weights=weights)
 
-
-        apply_quantization(model=language_model, weights=weights, quantization=quantization)
+        apply_quantization(
+            model=language_model, weights=weights, quantization=quantization
+        )
 
         language_model.load_weights(list(weights.items()), strict=False)
 
         return language_model
-
 
 
 class ConnectorAttention(nn.Module):
@@ -241,9 +256,15 @@ class ConnectorAttention(nn.Module):
         k = self.k_norm(k)
 
         # Reshape to (B, H, T, D) for SPLIT RoPE
-        q = mx.reshape(q, (batch_size, seq_len, self.num_heads, self.head_dim)).transpose(0, 2, 1, 3)
-        k = mx.reshape(k, (batch_size, seq_len, self.num_heads, self.head_dim)).transpose(0, 2, 1, 3)
-        v = mx.reshape(v, (batch_size, seq_len, self.num_heads, self.head_dim)).transpose(0, 2, 1, 3)
+        q = mx.reshape(
+            q, (batch_size, seq_len, self.num_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        k = mx.reshape(
+            k, (batch_size, seq_len, self.num_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        v = mx.reshape(
+            v, (batch_size, seq_len, self.num_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
 
         if pe is not None:
             # pe: tuple of (cos, sin) each with shape (1, num_heads, seq_len, head_dim//2)
@@ -292,7 +313,7 @@ class ConnectorAttention(nn.Module):
         out2 = x2 * cos_freq + x1 * sin_freq
 
         return mx.concatenate([out1, out2], axis=-1).astype(input_dtype)
-    
+
 
 class GEGLU(nn.Module):
     """GELU-gated linear unit."""
@@ -383,7 +404,9 @@ class Embeddings1DConnector(nn.Module):
         if num_learnable_registers > 0:
             self.learnable_registers = mx.zeros((num_learnable_registers, dim))
 
-    def _precompute_freqs_cis(self, seq_len: int, dtype: mx.Dtype) -> Tuple[mx.array, mx.array]:
+    def _precompute_freqs_cis(
+        self, seq_len: int, dtype: mx.Dtype
+    ) -> Tuple[mx.array, mx.array]:
         """Compute RoPE frequencies for connector (SPLIT type matching PyTorch).
 
         Returns tuple of (cos, sin) each with shape (1, num_heads, seq_len, head_dim//2).
@@ -448,11 +471,15 @@ class Embeddings1DConnector(nn.Module):
 
         # Binary mask: 1 for valid tokens, 0 for padded
         # attention_mask is additive: 0 for valid, large negative for padded
-        mask_binary = (attention_mask.squeeze(1).squeeze(1) >= -9000.0).astype(mx.int32)  # (batch, seq)
+        mask_binary = (attention_mask.squeeze(1).squeeze(1) >= -9000.0).astype(
+            mx.int32
+        )  # (batch, seq)
 
         # Tile registers to match sequence length, cast to hidden_states dtype
         num_tiles = seq_len // self.num_learnable_registers
-        registers = mx.tile(self.learnable_registers, (num_tiles, 1)).astype(dtype)  # (seq_len, dim)
+        registers = mx.tile(self.learnable_registers, (num_tiles, 1)).astype(
+            dtype
+        )  # (seq_len, dim)
 
         # Process each batch item (PyTorch uses advanced indexing)
         result_list = []
@@ -465,25 +492,33 @@ class Embeddings1DConnector(nn.Module):
 
             # Extract valid tokens (where mask is 1)
             # Since we have left-padded input, valid tokens are at the end
-            valid_tokens = hs_b[seq_len - num_valid:]  # (num_valid, dim)
+            valid_tokens = hs_b[seq_len - num_valid :]  # (num_valid, dim)
 
             # Pad with zeros on the right to get back to seq_len
             pad_length = seq_len - num_valid
             if pad_length > 0:
                 padding = mx.zeros((pad_length, dim), dtype=dtype)
-                adjusted = mx.concatenate([valid_tokens, padding], axis=0)  # (seq_len, dim)
+                adjusted = mx.concatenate(
+                    [valid_tokens, padding], axis=0
+                )  # (seq_len, dim)
             else:
                 adjusted = valid_tokens
 
             # Create flipped mask: 1s at front (where valid tokens now are), 0s at back
-            flipped_mask = mx.concatenate([
-                mx.ones((num_valid,), dtype=mx.int32),
-                mx.zeros((pad_length,), dtype=mx.int32)
-            ], axis=0)  # (seq,)
+            flipped_mask = mx.concatenate(
+                [
+                    mx.ones((num_valid,), dtype=mx.int32),
+                    mx.zeros((pad_length,), dtype=mx.int32),
+                ],
+                axis=0,
+            )  # (seq,)
 
             # Combine: valid tokens at front, registers at back
             flipped_mask_expanded = flipped_mask[:, None].astype(dtype)  # (seq, 1)
-            combined = flipped_mask_expanded * adjusted + (1 - flipped_mask_expanded) * registers
+            combined = (
+                flipped_mask_expanded * adjusted
+                + (1 - flipped_mask_expanded) * registers
+            )
             result_list.append(combined)
 
         hidden_states = mx.stack(result_list, axis=0)  # (batch, seq, dim)
@@ -510,13 +545,14 @@ class Embeddings1DConnector(nn.Module):
 
         # Process through transformer blocks
         for i in range(len(self.transformer_1d_blocks)):
-            hidden_states = self.transformer_1d_blocks[i](hidden_states, attention_mask, freqs_cis)
+            hidden_states = self.transformer_1d_blocks[i](
+                hidden_states, attention_mask, freqs_cis
+            )
 
         # Final RMS norm
         hidden_states = rms_norm(hidden_states)
 
         return hidden_states, attention_mask
-
 
 
 def norm_and_concat_hidden_states(
@@ -551,8 +587,12 @@ def norm_and_concat_hidden_states(
     mean = mx.sum(masked, axis=(1, 2), keepdims=True) / (denom + eps)
 
     # Compute masked min/max per layer
-    x_for_min = mx.where(mask, stacked, mx.full(stacked.shape, float('inf'), dtype=dtype))
-    x_for_max = mx.where(mask, stacked, mx.full(stacked.shape, float('-inf'), dtype=dtype))
+    x_for_min = mx.where(
+        mask, stacked, mx.full(stacked.shape, float("inf"), dtype=dtype)
+    )
+    x_for_max = mx.where(
+        mask, stacked, mx.full(stacked.shape, float("-inf"), dtype=dtype)
+    )
     x_min = mx.min(x_for_min, axis=(1, 2), keepdims=True)
     x_max = mx.max(x_for_max, axis=(1, 2), keepdims=True)
     range_val = x_max - x_min
@@ -578,9 +618,6 @@ class GemmaFeaturesExtractor(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.aggregate_embed(x)
-
-
-
 
 
 class AudioEmbeddingsConnector(nn.Module):
@@ -637,30 +674,55 @@ class LTX2TextEncoder(nn.Module):
 
         self.processor = None
 
-    def load(self, model_path: Optional[str] = None, text_encoder_path: Optional[str] = "google/gemma-3-12b-it"):
+    def load(
+        self,
+        model_path: Optional[str] = None,
+        text_encoder_path: Optional[str] = "google/gemma-3-12b-it",
+        use_unified: bool = False,
+    ):
+        model_path = Path(model_path) if model_path else None
 
         if Path(str(text_encoder_path)).joinpath("text_encoder").is_dir():
             text_encoder_path = str(Path(text_encoder_path) / "text_encoder")
-        
+
         self.language_model = LanguageModel.from_pretrained(text_encoder_path)
 
         # Load transformer weights for feature extractor and connector
-        transformer_files = list(model_path.glob("ltx-2-19*.safetensors"))
-        if transformer_files:
-            transformer_weights = mx.load(str(transformer_files[0]))
+        if use_unified and (model_path / "model.safetensors").exists():
+            all_weights = mx.load(str(model_path / "model.safetensors"))
+            # Build transformer_weights in format expected below (connector keys)
+            transformer_weights = {}
+            for k, v in all_weights.items():
+                if k.startswith("connector."):
+                    # Map connector.video_embeddings_connector. -> model.diffusion_model.video_embeddings_connector.
+                    new_k = k.replace("connector.", "model.diffusion_model.")
+                    transformer_weights[new_k] = v
+                elif k.startswith("text_embedding_projection."):
+                    transformer_weights[k] = v
+        else:
+            transformer_files = list(model_path.glob("ltx-2-19*.safetensors"))
+            transformer_weights = (
+                mx.load(str(transformer_files[0])) if transformer_files else {}
+            )
+
+        if transformer_weights:
 
             # Load feature extractor (aggregate_embed)
-            if "text_embedding_projection.aggregate_embed.weight" in transformer_weights:
+            if (
+                "text_embedding_projection.aggregate_embed.weight"
+                in transformer_weights
+            ):
                 self.feature_extractor.aggregate_embed.weight = transformer_weights[
                     "text_embedding_projection.aggregate_embed.weight"
                 ]
-
 
             # Load video_embeddings_connector weights
             connector_weights = {}
             for key, value in transformer_weights.items():
                 if key.startswith("model.diffusion_model.video_embeddings_connector."):
-                    new_key = key.replace("model.diffusion_model.video_embeddings_connector.", "")
+                    new_key = key.replace(
+                        "model.diffusion_model.video_embeddings_connector.", ""
+                    )
                     connector_weights[new_key] = value
 
             if connector_weights:
@@ -682,13 +744,17 @@ class LTX2TextEncoder(nn.Module):
 
                 # Manually load learnable_registers (it's a plain mx.array, not a parameter)
                 if "learnable_registers" in connector_weights:
-                    self.video_embeddings_connector.learnable_registers = connector_weights["learnable_registers"]
+                    self.video_embeddings_connector.learnable_registers = (
+                        connector_weights["learnable_registers"]
+                    )
 
             # Load audio_embeddings_connector weights (same structure as video connector)
             audio_connector_weights = {}
             for key, value in transformer_weights.items():
                 if key.startswith("model.diffusion_model.audio_embeddings_connector."):
-                    new_key = key.replace("model.diffusion_model.audio_embeddings_connector.", "")
+                    new_key = key.replace(
+                        "model.diffusion_model.audio_embeddings_connector.", ""
+                    )
                     audio_connector_weights[new_key] = value
 
             if audio_connector_weights:
@@ -710,15 +776,22 @@ class LTX2TextEncoder(nn.Module):
 
                 # Manually load learnable_registers (it's a plain mx.array, not a parameter)
                 if "learnable_registers" in audio_connector_weights:
-                    self.audio_embeddings_connector.learnable_registers = audio_connector_weights["learnable_registers"]
+                    self.audio_embeddings_connector.learnable_registers = (
+                        audio_connector_weights["learnable_registers"]
+                    )
 
         # Load tokenizer
         from transformers import AutoTokenizer
+
         tokenizer_path = model_path / "tokenizer"
         if tokenizer_path.exists():
-            self.processor = AutoTokenizer.from_pretrained(str(tokenizer_path), trust_remote_code=True)
+            self.processor = AutoTokenizer.from_pretrained(
+                str(tokenizer_path), trust_remote_code=True
+            )
         else:
-            self.processor = AutoTokenizer.from_pretrained(text_encoder_path, trust_remote_code=True)
+            self.processor = AutoTokenizer.from_pretrained(
+                text_encoder_path, trust_remote_code=True
+            )
         # Set left padding to match official LTX-2 text encoder
         self.processor.padding_side = "left"
 
@@ -755,7 +828,12 @@ class LTX2TextEncoder(nn.Module):
         input_ids = mx.array(inputs["input_ids"])
         attention_mask = mx.array(inputs["attention_mask"])
 
-        _, all_hidden_states = self.language_model(inputs=input_ids, input_embeddings=None, attention_mask=attention_mask, output_hidden_states=True)
+        _, all_hidden_states = self.language_model(
+            inputs=input_ids,
+            input_embeddings=None,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
         concat_hidden = norm_and_concat_hidden_states(
             all_hidden_states, attention_mask, padding_side="left"
         )
@@ -767,7 +845,9 @@ class LTX2TextEncoder(nn.Module):
 
         if return_audio_embeddings:
             # Process features through audio connector independently (same input as video)
-            audio_embeddings, _ = self.audio_embeddings_connector(features, additive_mask)
+            audio_embeddings, _ = self.audio_embeddings_connector(
+                features, additive_mask
+            )
             return video_embeddings, audio_embeddings
         else:
             return video_embeddings, attention_mask
@@ -806,7 +886,7 @@ class LTX2TextEncoder(nn.Module):
         # Remove leading/trailing whitespace
         response = response.strip()
         # Remove any leading punctuation
-        response = re.sub(r'^[^\w\s]+', '', response)
+        response = re.sub(r"^[^\w\s]+", "", response)
         return response
 
     def _apply_chat_template(
@@ -827,7 +907,9 @@ class LTX2TextEncoder(nn.Module):
                 elif isinstance(content, list):
                     # Handle multimodal content (image + text)
                     text_parts = [c["text"] for c in content if c.get("type") == "text"]
-                    formatted += f"<start_of_turn>user\n{' '.join(text_parts)}<end_of_turn>\n"
+                    formatted += (
+                        f"<start_of_turn>user\n{' '.join(text_parts)}<end_of_turn>\n"
+                    )
             elif role == "assistant":
                 formatted += f"<start_of_turn>model\n{content}<end_of_turn>\n"
         # Add generation prompt
@@ -855,11 +937,14 @@ class LTX2TextEncoder(nn.Module):
             Enhanced prompt string
         """
         from tqdm import tqdm
+
         try:
             from mlx_lm import stream_generate
             from mlx_lm.sample_utils import make_logits_processors, make_sampler
         except ImportError:
-            logging.warning("mlx-lm not available for prompt enhancement. Using original prompt.")
+            logging.warning(
+                "mlx-lm not available for prompt enhancement. Using original prompt."
+            )
             return prompt
 
         if self.processor is None:
@@ -878,7 +963,6 @@ class LTX2TextEncoder(nn.Module):
         # Use mlx-lm generate with temperature sampling
         mx.random.seed(seed)
 
-       
         # Tokenize
         inputs = self.processor(
             formatted,
@@ -887,13 +971,17 @@ class LTX2TextEncoder(nn.Module):
         )
         input_ids = mx.array(inputs["input_ids"])
 
-        sampler = make_sampler(kwargs.get("temperature", 0.7), kwargs.get("top_p", 1.0), top_k=kwargs.get("top_k", -1))
+        sampler = make_sampler(
+            kwargs.get("temperature", 0.7),
+            kwargs.get("top_p", 1.0),
+            top_k=kwargs.get("top_k", -1),
+        )
         logits_processors = make_logits_processors(
             kwargs.get("logit_bias", None),
             kwargs.get("repetition_penalty", 1.3),
             kwargs.get("repetition_context_size", 20),
         )
-        
+
         generated_token_count = 0
         generated_tokens = []
         for i, response in enumerate(
@@ -926,13 +1014,14 @@ class LTX2TextEncoder(nn.Module):
 
         # Decode only the new tokens
 
-        enhanced_prompt = self.processor.decode(generated_tokens, skip_special_tokens=True)
+        enhanced_prompt = self.processor.decode(
+            generated_tokens, skip_special_tokens=True
+        )
 
         enhanced_prompt = self._clean_response(enhanced_prompt)
         logging.info(f"Enhanced prompt: {enhanced_prompt}")
 
         return enhanced_prompt
-
 
     def enhance_i2v(
         self,
@@ -967,4 +1056,3 @@ def load_text_encoder(model_path: str = "/tmp/ltx2") -> LTX2TextEncoder:
     encoder = LTX2TextEncoder()
     encoder.load(model_path=model_path)
     return encoder
-

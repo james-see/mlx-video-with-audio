@@ -52,8 +52,10 @@ from mlx_video.conditioning.latent import LatentState, apply_denoise_mask
 STAGE_1_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 
-# Default HuggingFace model for text encoder
+# Default HuggingFace model for text encoder (only used when NOT using unified MLX model)
 DEFAULT_HF_MODEL = "Lightricks/LTX-2"
+# Default MLX Gemma for text encoder when using unified model (avoids 150GB Lightricks download)
+DEFAULT_UNIFIED_TEXT_ENCODER = "mlx-community/gemma-3-12b-it-bf16"
 
 
 def is_unified_mlx_model(model_path: Path) -> bool:
@@ -224,7 +226,11 @@ def denoise_av(
     total_steps = len(sigmas) - 1
     for i in tqdm(range(total_steps), desc="Denoising A/V", disable=not verbose):
         # Emit structured progress for external parsers
-        print(f"STAGE:{stage}:STEP:{i + 1}:{total_steps}:Denoising", file=sys.stderr, flush=True)
+        print(
+            f"STAGE:{stage}:STEP:{i + 1}:{total_steps}:Denoising",
+            file=sys.stderr,
+            flush=True,
+        )
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
 
         # Flatten video latents
@@ -536,10 +542,15 @@ def generate_video_with_audio(
     # Check if using unified MLX model format
     use_unified = is_unified_mlx_model(model_path)
     if use_unified:
-        print(f"{Colors.DIM}Using unified MLX model format{Colors.RESET}")
-        # For unified models, we still need HuggingFace model for text encoder and upsampler
-        hf_model_path = get_model_path(text_encoder_repo or DEFAULT_HF_MODEL)
-        text_encoder_path = hf_model_path
+        print(
+            f"{Colors.DIM}Using unified MLX model format (no Lightricks download){Colors.RESET}"
+        )
+        # Use unified model path for everything - VAE, upsampler, connectors from model.safetensors
+        # Gemma language model from MLX community (avoids 150GB Lightricks/LTX-2 download)
+        hf_model_path = model_path
+        text_encoder_path = get_model_path(
+            text_encoder_repo or DEFAULT_UNIFIED_TEXT_ENCODER
+        )
     else:
         text_encoder_path = (
             model_path
@@ -560,7 +571,11 @@ def generate_video_with_audio(
     from mlx_video.models.ltx.text_encoder import LTX2TextEncoder
 
     text_encoder = LTX2TextEncoder()
-    text_encoder.load(model_path=hf_model_path, text_encoder_path=text_encoder_path)
+    text_encoder.load(
+        model_path=hf_model_path,
+        text_encoder_path=text_encoder_path,
+        use_unified=use_unified,
+    )
     mx.eval(text_encoder.parameters())
 
     # Optionally enhance prompt
@@ -653,9 +668,13 @@ def generate_video_with_audio(
         print(
             f"{Colors.BLUE}🖼️  Loading VAE encoder and encoding image...{Colors.RESET}"
         )
-        # VAE encoder always comes from HuggingFace model (not in unified format)
         vae_encoder = load_vae_encoder(
-            str(hf_model_path / "ltx-2-19b-distilled.safetensors")
+            (
+                str(hf_model_path / "ltx-2-19b-distilled.safetensors")
+                if not use_unified
+                else str(model_path)
+            ),
+            use_unified=use_unified,
         )
         mx.eval(vae_encoder.parameters())
 
@@ -751,16 +770,24 @@ def generate_video_with_audio(
 
     # Upsample video latents
     print(f"{Colors.MAGENTA}🔍 Upsampling video latents 2x...{Colors.RESET}")
-    # Upsampler always comes from HuggingFace model (separate file)
     upsampler = load_upsampler(
-        str(hf_model_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors")
+        (
+            str(hf_model_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors")
+            if not use_unified
+            else str(model_path)
+        ),
+        use_unified=use_unified,
     )
     mx.eval(upsampler.parameters())
 
-    # VAE decoder from HuggingFace (unified format doesn't include latent stats needed for upsampling)
     vae_decoder = load_vae_decoder(
-        str(hf_model_path / "ltx-2-19b-distilled.safetensors"),
-        timestep_conditioning=None,  # Auto-detect from model metadata
+        (
+            str(hf_model_path / "ltx-2-19b-distilled.safetensors")
+            if not use_unified
+            else str(model_path)
+        ),
+        timestep_conditioning=None,
+        use_unified=use_unified,
     )
 
     video_latents = upsample_latents(
@@ -1045,8 +1072,8 @@ Examples:
     parser.add_argument(
         "--model-repo",
         type=str,
-        default="Lightricks/LTX-2",
-        help="Model repository (default: Lightricks/LTX-2)",
+        default="notapalindrome/ltx2-mlx-av",
+        help="Model repository (default: notapalindrome/ltx2-mlx-av, ~42GB unified MLX)",
     )
     parser.add_argument(
         "--text-encoder-repo", type=str, default=None, help="Text encoder repository"

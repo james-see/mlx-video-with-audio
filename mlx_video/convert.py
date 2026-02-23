@@ -643,6 +643,17 @@ def convert(
             connector_count += 1
     print(f"  Added {connector_count} connector weights")
 
+    # 8. Add upsampler weights (enables fully self-contained unified model)
+    upsampler_path = model_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+    if upsampler_path.exists():
+        print("Processing upsampler weights...")
+        upsampler_weights = mx.load(str(upsampler_path))
+        for k, v in upsampler_weights.items():
+            unified_weights[f"upsampler.{k}"] = v
+        print(f"  Added {len(upsampler_weights)} upsampler weights")
+    else:
+        print("  Skipping upsampler (not found, will fallback to download at runtime)")
+
     print(f"Total unified weights: {len(unified_weights)}")
 
     # Convert dtype if specified

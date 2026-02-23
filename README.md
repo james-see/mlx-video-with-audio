@@ -51,7 +51,7 @@ brew install ffmpeg
 
 [LTX-2](https://huggingface.co/Lightricks/LTX-Video) is a 19B parameter video generation model from Lightricks with audio generation capabilities.
 
-> **Note:** Currently, only the distilled variant (`ltx-2-19b-distilled`) is supported.
+**Recommended:** Use the unified MLX model `notapalindrome/ltx2-mlx-av` (~42GB). It avoids downloading the full Lightricks/LTX-2 (~150GB) by using MLX-community Gemma for the text encoder.
 
 ## Usage
 
@@ -117,7 +117,7 @@ uv run mlx_video.generate --prompt "Two dogs of the poodle breed wearing sunglas
 | `--image-frame-idx` | 0 | Frame index to condition (0 = first frame) |
 | `--enhance-prompt` | false | Enhance prompt using Gemma |
 | `--tiling` | auto | Tiling mode for VAE (auto/none/default/aggressive/conservative) |
-| `--model-repo` | Lightricks/LTX-2 | HuggingFace model repository |
+| `--model-repo` | notapalindrome/ltx2-mlx-av | Model repo (~42GB unified MLX, no Lightricks download) |
 
 ### generate (Video-Only)
 
@@ -131,7 +131,7 @@ uv run mlx_video.generate --prompt "Two dogs of the poodle breed wearing sunglas
 | `--fps` | 24 | Frames per second |
 | `--output`, `-o` | output.mp4 | Output video path |
 | `--save-frames` | false | Save individual frames as images |
-| `--model-repo` | Lightricks/LTX-2 | HuggingFace model repository |
+| `--model-repo` | notapalindrome/ltx2-mlx-av | Model repo (~42GB unified MLX, no Lightricks download) |
 
 ### convert (Model Conversion)
 

@@ -12,14 +12,20 @@ import json
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_video.models.ltx.video_vae.video_vae import VideoEncoder, LogVarianceType, NormLayerType, PaddingModeType
+from mlx_video.models.ltx.video_vae.video_vae import (
+    VideoEncoder,
+    LogVarianceType,
+    NormLayerType,
+    PaddingModeType,
+)
 
 
-def load_vae_encoder(model_path: str) -> VideoEncoder:
+def load_vae_encoder(model_path: str, use_unified: bool = False) -> VideoEncoder:
     """Load VAE encoder from safetensors file.
 
     Args:
         model_path: Path to the model weights (safetensors file or directory)
+        use_unified: If True, load from unified model.safetensors with vae_encoder. prefix
 
     Returns:
         Loaded VideoEncoder instance
@@ -28,15 +34,23 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
 
     model_path = Path(model_path)
 
-    # Try to find the weights file
-    if model_path.is_file() and model_path.suffix == ".safetensors":
-        weights_path = model_path
-    elif (model_path / "ltx-2-19b-distilled.safetensors").exists():
-        weights_path = model_path / "ltx-2-19b-distilled.safetensors"
-    elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
-        weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
+    # Unified MLX format: model.safetensors with vae_encoder. prefix
+    if use_unified and (model_path / "model.safetensors").exists():
+        weights_path = model_path / "model.safetensors"
+        unified_prefix = "vae_encoder."
     else:
-        raise FileNotFoundError(f"VAE weights not found at {model_path}")
+        unified_prefix = None
+
+    if unified_prefix is None:
+        # Try to find the weights file
+        if model_path.is_file() and model_path.suffix == ".safetensors":
+            weights_path = model_path
+        elif (model_path / "ltx-2-19b-distilled.safetensors").exists():
+            weights_path = model_path / "ltx-2-19b-distilled.safetensors"
+        elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
+            weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
+        else:
+            raise FileNotFoundError(f"VAE weights not found at {model_path}")
 
     print(f"Loading VAE encoder from {weights_path}...")
 
@@ -62,7 +76,11 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
 
                 # Parse other config
                 norm_str = vae_config.get("norm_layer", "pixel_norm")
-                norm_layer = NormLayerType.PIXEL_NORM if norm_str == "pixel_norm" else NormLayerType.GROUP_NORM
+                norm_layer = (
+                    NormLayerType.PIXEL_NORM
+                    if norm_str == "pixel_norm"
+                    else NormLayerType.GROUP_NORM
+                )
 
                 var_str = vae_config.get("latent_log_var", "uniform")
                 if var_str == "uniform":
@@ -76,7 +94,9 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
 
                 patch_size = vae_config.get("patch_size", 4)
 
-                print(f"  Loaded config: {len(encoder_blocks)} encoder blocks, norm={norm_str}, patch_size={patch_size}")
+                print(
+                    f"  Loaded config: {len(encoder_blocks)} encoder blocks, norm={norm_str}, patch_size={patch_size}"
+                )
     except Exception as e:
         print(f"  Could not read config from metadata: {e}")
         # Use default config
@@ -108,10 +128,18 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
     # Load weights
     weights = mx.load(str(weights_path))
 
+    # Filter by unified prefix if loading from unified model
+    if unified_prefix:
+        weights = {k: v for k, v in weights.items() if k.startswith(unified_prefix)}
+
     # Determine prefix based on weight keys
     has_vae_prefix = any(k.startswith("vae.") for k in weights.keys())
+    has_vae_encoder_prefix = any(k.startswith("vae_encoder.") for k in weights.keys())
 
-    if has_vae_prefix:
+    if has_vae_encoder_prefix:
+        prefix = "vae_encoder."
+        stats_prefix = "vae_encoder."
+    elif has_vae_prefix:
         prefix = "vae.encoder."
         stats_prefix = "vae.per_channel_statistics."
     else:
@@ -119,9 +147,12 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
         stats_prefix = "per_channel_statistics."
 
     # Load per-channel statistics for normalization
-    mean_key = f"{stats_prefix}mean-of-means"
-    std_key = f"{stats_prefix}std-of-means"
-
+    if has_vae_encoder_prefix:
+        mean_key = "vae_encoder.per_channel_statistics._mean_of_means"
+        std_key = "vae_encoder.per_channel_statistics._std_of_means"
+    else:
+        mean_key = f"{stats_prefix}mean-of-means"
+        std_key = f"{stats_prefix}std-of-means"
     if mean_key in weights:
         encoder.per_channel_statistics.mean = weights[mean_key]
         print(f"  Loaded latent mean: shape {weights[mean_key].shape}")
@@ -136,7 +167,7 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
             continue
 
         # Remove prefix
-        new_key = key[len(prefix):]
+        new_key = key[len(prefix) :]
 
         # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
         if ".weight" in key and value.ndim == 5:

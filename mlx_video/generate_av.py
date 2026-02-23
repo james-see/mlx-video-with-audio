@@ -466,6 +466,7 @@ def generate_video_with_audio(
     output_audio_path: Optional[str] = None,
     verbose: bool = True,
     enhance_prompt: bool = False,
+    use_uncensored_enhancer: bool = False,
     max_tokens: int = 512,
     temperature: float = 0.7,
     image: Optional[str] = None,
@@ -561,14 +562,32 @@ def generate_video_with_audio(
 
     # Optionally enhance prompt
     if enhance_prompt:
-        print(f"{Colors.MAGENTA}✨ Enhancing prompt...{Colors.RESET}")
-        prompt = text_encoder.enhance_t2v(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            seed=seed,
-            verbose=verbose,
-        )
+        if use_uncensored_enhancer:
+            from mlx_video.models.ltx.enhance_prompt import enhance_with_model
+
+            print(f"{Colors.MAGENTA}✨ Enhancing prompt (uncensored)...{Colors.RESET}")
+            system_prompt = None
+            if is_i2v:
+                from mlx_video.models.ltx.enhance_prompt import _load_system_prompt
+
+                system_prompt = _load_system_prompt("gemma_i2v_system_prompt.txt")
+            prompt = enhance_with_model(
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                seed=seed,
+                max_tokens=max_tokens,
+                verbose=verbose,
+            )
+        else:
+            print(f"{Colors.MAGENTA}✨ Enhancing prompt...{Colors.RESET}")
+            prompt = text_encoder.enhance_t2v(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=seed,
+                verbose=verbose,
+            )
         print(
             f"{Colors.DIM}Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}{Colors.RESET}"
         )
@@ -1019,6 +1038,11 @@ Examples:
         "--enhance-prompt", action="store_true", help="Enhance prompt using Gemma"
     )
     parser.add_argument(
+        "--use-uncensored-enhancer",
+        action="store_true",
+        help="Use uncensored Gemma 12B for prompt enhancement (avoids content filters)",
+    )
+    parser.add_argument(
         "--max-tokens", type=int, default=512, help="Max tokens for prompt enhancement"
     )
     parser.add_argument(
@@ -1079,6 +1103,7 @@ Examples:
         output_audio_path=args.output_audio,
         verbose=args.verbose,
         enhance_prompt=args.enhance_prompt,
+        use_uncensored_enhancer=args.use_uncensored_enhancer,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         image=args.image,

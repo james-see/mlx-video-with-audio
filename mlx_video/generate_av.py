@@ -1,7 +1,9 @@
 """Audio-Video generation pipeline for LTX-2."""
 
 import argparse
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -464,6 +466,7 @@ def generate_video_with_audio(
     fps: int = 24,
     output_path: str = "output_av.mp4",
     output_audio_path: Optional[str] = None,
+    save_audio_separately: bool = False,
     verbose: bool = True,
     enhance_prompt: bool = False,
     use_uncensored_enhancer: bool = False,
@@ -933,23 +936,33 @@ def generate_video_with_audio(
         print(f"{Colors.RED}❌ Video encoding failed: {e}{Colors.RESET}")
         return None, None
 
-    # Save audio
-    audio_path = (
-        output_path.with_suffix(".wav")
-        if output_audio_path is None
-        else Path(output_audio_path)
-    )
+    # Save audio (to temp file or final path)
+    keep_audio_file = save_audio_separately or output_audio_path is not None
+    if output_audio_path is not None:
+        audio_path = Path(output_audio_path)
+    elif save_audio_separately:
+        audio_path = output_path.with_suffix(".wav")
+    else:
+        fd, tmp = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        audio_path = Path(tmp)
+
     save_audio(audio_np, audio_path, AUDIO_SAMPLE_RATE)
-    print(f"{Colors.GREEN}✅ Saved audio to{Colors.RESET} {audio_path}")
+    if keep_audio_file:
+        print(f"{Colors.GREEN}✅ Saved audio to{Colors.RESET} {audio_path}")
 
     # Mux video and audio
     print(f"{Colors.BLUE}🎬 Combining video and audio...{Colors.RESET}")
     if mux_video_audio(temp_video_path, audio_path, output_path):
         print(f"{Colors.GREEN}✅ Saved video with audio to{Colors.RESET} {output_path}")
         temp_video_path.unlink()  # Remove temp file
+        if not keep_audio_file:
+            audio_path.unlink()  # Remove temp audio
     else:
         # Fallback: keep video without audio
         temp_video_path.rename(output_path)
+        if not keep_audio_file:
+            audio_path.unlink()  # Remove temp audio
         print(
             f"{Colors.YELLOW}⚠️  Saved video without audio to{Colors.RESET} {output_path}"
         )
@@ -1023,6 +1036,11 @@ Examples:
         type=str,
         default=None,
         help="Output audio path (default: same as video with .wav)",
+    )
+    parser.add_argument(
+        "--save-audio-separately",
+        action="store_true",
+        help="Keep the .wav audio file alongside the video (default: off, audio only in mp4)",
     )
     parser.add_argument(
         "--model-repo",
@@ -1101,6 +1119,7 @@ Examples:
         fps=args.fps,
         output_path=args.output_path,
         output_audio_path=args.output_audio,
+        save_audio_separately=args.save_audio_separately,
         verbose=args.verbose,
         enhance_prompt=args.enhance_prompt,
         use_uncensored_enhancer=args.use_uncensored_enhancer,

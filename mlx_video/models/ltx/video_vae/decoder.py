@@ -660,6 +660,16 @@ def load_vae_decoder(
         # Skip when loading from unified model - convert script already saved MLX format
         if ".conv.weight" in key and value.ndim == 5 and not unified_prefix:
             value = mx.transpose(value, (0, 2, 3, 4, 1))
+        # Some unified checkpoints contain malformed conv3d layout:
+        # (O, D, H, I, W) instead of (O, D, H, W, I). Fix by swapping trailing dims.
+        if (
+            ".conv.weight" in key
+            and value.ndim == 5
+            and value.shape[-1] <= 5
+            and value.shape[-2] > value.shape[-1]
+        ):
+            value = mx.transpose(value, (0, 1, 2, 4, 3))
+            print(f"  Fixed malformed Conv3d layout for {key}: now {value.shape}")
         if ".conv.bias" in key:
             pass  # bias doesn't need transpose
 

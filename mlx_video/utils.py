@@ -10,6 +10,14 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 
 
+# Text encoder options for unified model (smaller first - prefer cached)
+TEXT_ENCODER_OPTIONS = [
+    "TheCluster/amoral-gemma-3-12B-v2-mlx-4bit",  # ~7.5GB, 4-bit quantized
+    "mlx-community/gemma-3-12b-it-bf16",  # ~24GB, full bf16
+]
+DEFAULT_TEXT_ENCODER = TEXT_ENCODER_OPTIONS[0]  # Smaller download when none cached
+
+
 def get_model_path(model_repo: str):
     """Get or download LTX-2 model path.
 
@@ -37,6 +45,36 @@ def get_model_path(model_repo: str):
                 allow_patterns=["*.safetensors", "*.json"],
             )
         )
+
+
+def get_text_encoder_path(text_encoder_repo: Optional[str] = None) -> Path:
+    """Get text encoder path: use cached if available, else download smaller model.
+
+    Prefers cached Gemma models. If none cached, downloads the smaller 4-bit
+    variant (~7.5GB) instead of full bf16 (~24GB).
+
+    Args:
+        text_encoder_repo: Explicit repo ID, or None for auto-selection
+
+    Returns:
+        Path to text encoder model directory
+    """
+    if text_encoder_repo:
+        return get_model_path(text_encoder_repo)
+
+    # Try cached models first (smaller first)
+    for repo_id in TEXT_ENCODER_OPTIONS:
+        try:
+            path = Path(snapshot_download(repo_id=repo_id, local_files_only=True))
+            if path.exists():
+                print(f"Using cached text encoder: {repo_id}")
+                return path
+        except Exception:
+            continue
+
+    # None cached - download the smaller one
+    print(f"No text encoder cached. Downloading {DEFAULT_TEXT_ENCODER} (~7.5GB)...")
+    return get_model_path(DEFAULT_TEXT_ENCODER)
 
 
 def apply_quantization(model: nn.Module, weights: mx.array, quantization: dict):

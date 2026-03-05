@@ -51,7 +51,7 @@ brew install ffmpeg
 
 [LTX-2](https://huggingface.co/Lightricks/LTX-Video) is a 19B parameter video generation model from Lightricks with audio generation capabilities.
 
-**Recommended:** Use the unified MLX model `notapalindrome/ltx2-mlx-av` (~42GB). It avoids downloading the full Lightricks/LTX-2 (~150GB) by using a Gemma text encoder. The app auto-uses whichever Gemma is already cached (amoral-gemma ~7.5GB or gemma-3-12b-it-bf16 ~24GB); if none cached, downloads the smaller 4-bit variant (~7.5GB).
+**Recommended:** Use the unified MLX model `notapalindrome/ltx2-mlx-av` (~42GB). It avoids downloading the full Lightricks/LTX-2 (~150GB) by using MLX-community Gemma for the text encoder.
 
 ## Usage
 

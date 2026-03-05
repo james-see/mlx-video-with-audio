@@ -37,7 +37,6 @@ from mlx_video.convert import (
 from mlx_video.utils import (
     to_denoised,
     get_model_path,
-    get_text_encoder_path,
     load_image,
     prepare_image_for_encoding,
 )
@@ -55,6 +54,8 @@ STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 
 # Default HuggingFace model for text encoder (only used when NOT using unified MLX model)
 DEFAULT_HF_MODEL = "Lightricks/LTX-2"
+# Default MLX Gemma for text encoder when using unified model (quality-first)
+DEFAULT_UNIFIED_TEXT_ENCODER = "mlx-community/gemma-3-12b-it-bf16"
 
 
 def is_unified_mlx_model(model_path: Path) -> bool:
@@ -545,9 +546,11 @@ def generate_video_with_audio(
             f"{Colors.DIM}Using unified MLX model format (no Lightricks download){Colors.RESET}"
         )
         # Use unified model path for everything - VAE, upsampler, connectors from model.safetensors
-        # Text encoder: use cached Gemma if available, else download smaller 4-bit (~7.5GB)
+        # Use official bf16 Gemma text encoder for quality/compatibility
         hf_model_path = model_path
-        text_encoder_path = get_text_encoder_path(text_encoder_repo)
+        text_encoder_path = get_model_path(
+            text_encoder_repo or DEFAULT_UNIFIED_TEXT_ENCODER
+        )
     else:
         text_encoder_path = (
             model_path

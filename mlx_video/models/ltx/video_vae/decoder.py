@@ -657,7 +657,8 @@ def load_vae_decoder(
         new_key = key[len(prefix) :]
 
         # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
-        if ".conv.weight" in key and value.ndim == 5:
+        # Skip when loading from unified model - convert script already saved MLX format
+        if ".conv.weight" in key and value.ndim == 5 and not unified_prefix:
             value = mx.transpose(value, (0, 2, 3, 4, 1))
         if ".conv.bias" in key:
             pass  # bias doesn't need transpose

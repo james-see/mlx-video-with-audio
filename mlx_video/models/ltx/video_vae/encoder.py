@@ -170,7 +170,8 @@ def load_vae_encoder(model_path: str, use_unified: bool = False) -> VideoEncoder
         new_key = key[len(prefix) :]
 
         # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
-        if ".weight" in key and value.ndim == 5:
+        # Skip when loading from unified model - convert script already saved MLX format
+        if ".weight" in key and value.ndim == 5 and not unified_prefix:
             value = mx.transpose(value, (0, 2, 3, 4, 1))
 
         encoder_weights[new_key] = value

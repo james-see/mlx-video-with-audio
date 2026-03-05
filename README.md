@@ -53,6 +53,9 @@ brew install ffmpeg
 
 **Recommended:** Use the unified MLX model `notapalindrome/ltx2-mlx-av` (~42GB). It avoids downloading the full Lightricks/LTX-2 (~150GB) by using MLX-community Gemma for the text encoder.
 
+> **Important:** The Gemma text encoder is required for normal generation embeddings (video/audio conditioning), even when prompt enhancement is disabled.  
+> Prompt enhancement is a separate optional step that rewrites the prompt text before generation.
+
 ## Usage
 
 This project uses [uv](https://docs.astral.sh/uv/) for dependency management and isolation.

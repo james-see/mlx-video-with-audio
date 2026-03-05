@@ -694,8 +694,9 @@ class LTX2TextEncoder(nn.Module):
             transformer_weights = {}
             for k, v in all_weights.items():
                 if k.startswith("connector."):
-                    # Map connector.video_embeddings_connector. -> model.diffusion_model.video_embeddings_connector.
-                    new_k = k.replace("connector.", "model.diffusion_model.")
+                    # Map prefix only:
+                    # connector.video_embeddings_connector.* -> model.diffusion_model.video_embeddings_connector.*
+                    new_k = "model.diffusion_model." + k[len("connector.") :]
                     transformer_weights[new_k] = v
                 elif k.startswith("text_embedding_projection."):
                     transformer_weights[k] = v

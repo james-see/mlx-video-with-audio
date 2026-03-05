@@ -10,6 +10,26 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 
 
+def get_model_path(model_repo: str):
+    """Get or download model path from local dir or HuggingFace repo."""
+    local_path = Path(model_repo).expanduser()
+    if local_path.exists() and local_path.is_dir():
+        return local_path
+
+    try:
+        return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
+    except Exception:
+        print("Downloading model weights...")
+        return Path(
+            snapshot_download(
+                repo_id=model_repo,
+                local_files_only=False,
+                resume_download=True,
+                allow_patterns=["*.safetensors", "*.json"],
+            )
+        )
+
+
 def apply_quantization(model: nn.Module, weights: mx.array, quantization: dict):
     if quantization is not None:
 

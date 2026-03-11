@@ -549,7 +549,7 @@ class WanVAE(nn.Module):
         Returns:
             Video [B, 3, T_out, H_out, W_out] clamped to [-1, 1]
         """
-        from mlx_video.models.ltx.video_vae.tiling import TilingConfig, decode_with_tiling
+        from mlx_video.models.wan.tiling import TilingConfig, decode_with_tiling
 
         if tiling_config is None:
             tiling_config = TilingConfig.default()

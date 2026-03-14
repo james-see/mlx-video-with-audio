@@ -1,6 +1,7 @@
 """Audio-Video generation pipeline for LTX-2."""
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -71,6 +72,47 @@ def is_unified_mlx_model(model_path: Path) -> bool:
     has_config = (model_path / "config.json").exists()
     has_hf_format = (model_path / "ltx-2-19b-distilled.safetensors").exists()
     return has_unified and has_config and not has_hf_format
+
+
+def _looks_like_text_config(config_dict: dict) -> bool:
+    required = {
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+    }
+    if "text_config" in config_dict and isinstance(config_dict["text_config"], dict):
+        return True
+    return required.issubset(set(config_dict.keys()))
+
+
+def validate_text_encoder_config(text_encoder_path: Path) -> None:
+    """Validate that the resolved text encoder path contains a usable config."""
+    config_file = text_encoder_path / "config.json"
+    if not config_file.exists():
+        raise ValueError(f"Text encoder config not found at {config_file}")
+
+    with open(config_file, "r") as f:
+        config_dict = json.load(f)
+
+    keys = sorted(config_dict.keys())
+    print(f"TEXT_ENCODER:PATH:{text_encoder_path}", file=sys.stderr, flush=True)
+    print(
+        f"TEXT_ENCODER:CONFIG_KEYS:{','.join(keys[:20])}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if not _looks_like_text_config(config_dict):
+        key_preview = ", ".join(keys[:20]) if keys else "<none>"
+        message = (
+            "Text encoder config is missing `text_config`. "
+            f"Resolved path: {text_encoder_path}. "
+            f"Top-level keys: [{key_preview}]. "
+            "Use --text-encoder-repo mlx-community/gemma-3-12b-it-bf16 or update mlx-video-with-audio."
+        )
+        print(f"TEXT_ENCODER_CONFIG_ERROR:{message}", file=sys.stderr, flush=True)
+        raise ValueError(message)
 
 
 def load_unified_weights(model_path: Path, prefix: str) -> dict:
@@ -558,6 +600,11 @@ def generate_video_with_audio(
             else get_model_path(text_encoder_repo)
         )
         hf_model_path = model_path  # For upsampler, VAE, etc.
+
+    print(f"RESOLVE:MODEL_PATH:{model_path}", file=sys.stderr, flush=True)
+    print(f"RESOLVE:USE_UNIFIED:{use_unified}", file=sys.stderr, flush=True)
+    print(f"RESOLVE:TEXT_ENCODER_PATH:{text_encoder_path}", file=sys.stderr, flush=True)
+    validate_text_encoder_config(Path(text_encoder_path))
 
     # Calculate latent dimensions
     stage1_h, stage1_w = height // 2 // 32, width // 2 // 32

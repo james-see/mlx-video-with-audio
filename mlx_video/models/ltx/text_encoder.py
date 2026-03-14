@@ -1,7 +1,9 @@
 import functools
+import json
 import logging
 import math
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -19,6 +21,34 @@ from mlx_vlm.models.gemma3.config import TextConfig
 
 # Path to system prompts
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+
+def _extract_text_config(config_dict: dict, model_path: Path) -> dict:
+    """Resolve the text encoder config payload from config.json."""
+    nested_config = config_dict.get("text_config")
+    if isinstance(nested_config, dict):
+        return nested_config
+
+    # Some checkpoints store text config fields at top level.
+    flat_required = {
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+    }
+    if flat_required.issubset(set(config_dict.keys())):
+        return config_dict
+
+    keys = sorted(config_dict.keys())
+    key_preview = ", ".join(keys[:20]) if keys else "<none>"
+    raise ValueError(
+        "Text encoder config is missing `text_config` at "
+        f"{model_path}. Found top-level keys: [{key_preview}]. "
+        "This path appears to be a unified AV model config, not a Gemma text "
+        "encoder config. Use --text-encoder-repo mlx-community/gemma-3-12b-it-bf16 "
+        "or update mlx-video-with-audio."
+    )
 
 
 def _load_system_prompt(prompt_name: str) -> str:
@@ -182,8 +212,6 @@ class LanguageModel(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_path: str):
-        import json
-
         weight_files = sorted(Path(model_path).glob("*.safetensors"))
         config_file = Path(model_path) / "config.json"
         config_dict = {}
@@ -191,9 +219,15 @@ class LanguageModel(nn.Module):
             with open(config_file, "r") as f:
                 config_dict = json.load(f)
 
-            language_model = cls(
-                config=TextConfig.from_dict(config_dict["text_config"])
+            keys = sorted(config_dict.keys())
+            print(f"TEXT_ENCODER:PATH:{model_path}", file=sys.stderr, flush=True)
+            print(
+                f"TEXT_ENCODER:CONFIG_KEYS:{','.join(keys[:20])}",
+                file=sys.stderr,
+                flush=True,
             )
+            text_config = _extract_text_config(config_dict, Path(model_path))
+            language_model = cls(config=TextConfig.from_dict(text_config))
         else:
             raise ValueError(f"Config file not found at {model_path}")
 

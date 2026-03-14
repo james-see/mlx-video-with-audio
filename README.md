@@ -48,6 +48,9 @@ brew install ffmpeg
 ## Supported Models
 
 ### LTX-2
+- [**LTX-2**](https://huggingface.co/Lightricks/LTX-Video) — 19B parameter video generation model from Lightricks
+- [**Wan2.1**](https://github.com/Wan-Video/Wan2.1) — 1.3B / 14B parameter T2V models (single-model pipeline)
+- [**Wan2.2**](https://github.com/Wan-Video/Wan2.2) — T2V-14B, TI2V-5B, and I2V-14B models (dual-model pipeline)
 
 [LTX-2](https://huggingface.co/Lightricks/LTX-Video) is a 19B parameter video generation model from Lightricks with audio generation capabilities.
 
@@ -56,8 +59,14 @@ brew install ffmpeg
 > **Important:** The Gemma text encoder is required for normal generation embeddings (video/audio conditioning), even when prompt enhancement is disabled.  
 > Prompt enhancement is a separate optional step that rewrites the prompt text before generation.
 > If prompt enhancement fails, generation now falls back to the original prompt automatically.
+- Text-to-video generation with multiple model families
+- LTX-2: Two-stage pipeline with 2x spatial upscaling
+- Wan2.1/2.2: Flow-matching diffusion with classifier-free guidance
+- Optimized for Apple Silicon using MLX
 
-## Usage
+---
+
+## LTX-2
 
 This project uses [uv](https://docs.astral.sh/uv/) for dependency management and isolation.
 
@@ -188,7 +197,7 @@ uv run mlx_video.generate_av \
 - **Smaller footprint**: Only includes necessary weights (no quantized variants)
 - **Easy sharing**: Upload to HuggingFace for others to use
 
-## How It Works
+### How It Works (LTX-2)
 
 ### Video Generation Pipeline
 

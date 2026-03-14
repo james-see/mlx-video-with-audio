@@ -580,35 +580,57 @@ def generate_video_with_audio(
 
     # Optionally enhance prompt
     if enhance_prompt:
-        if use_uncensored_enhancer:
-            from mlx_video.models.ltx.enhance_prompt import enhance_with_model
+        original_prompt = prompt
+        try:
+            if use_uncensored_enhancer:
+                from mlx_video.models.ltx.enhance_prompt import enhance_with_model
 
-            print(f"{Colors.MAGENTA}✨ Enhancing prompt (uncensored)...{Colors.RESET}")
-            system_prompt = None
-            if is_i2v:
-                from mlx_video.models.ltx.enhance_prompt import _load_system_prompt
+                print(
+                    f"{Colors.MAGENTA}✨ Enhancing prompt (uncensored)...{Colors.RESET}"
+                )
+                system_prompt = None
+                if is_i2v:
+                    from mlx_video.models.ltx.enhance_prompt import _load_system_prompt
 
-                system_prompt = _load_system_prompt("gemma_i2v_system_prompt.txt")
-            prompt = enhance_with_model(
-                prompt,
-                system_prompt=system_prompt,
-                temperature=temperature,
-                seed=seed,
-                max_tokens=max_tokens,
-                verbose=verbose,
+                    system_prompt = _load_system_prompt("gemma_i2v_system_prompt.txt")
+                prompt = enhance_with_model(
+                    prompt,
+                    system_prompt=system_prompt,
+                    temperature=temperature,
+                    seed=seed,
+                    max_tokens=max_tokens,
+                    verbose=verbose,
+                )
+            else:
+                print(f"{Colors.MAGENTA}✨ Enhancing prompt...{Colors.RESET}")
+                prompt = text_encoder.enhance_t2v(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    seed=seed,
+                    verbose=verbose,
+                )
+
+            if not prompt or not str(prompt).strip():
+                raise ValueError("Prompt enhancer returned empty output")
+
+            # Structured token for host apps to capture final rewritten prompt.
+            print(f"ENHANCED_PROMPT:{prompt}", file=sys.stderr, flush=True)
+            print(
+                f"{Colors.DIM}Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}{Colors.RESET}"
             )
-        else:
-            print(f"{Colors.MAGENTA}✨ Enhancing prompt...{Colors.RESET}")
-            prompt = text_encoder.enhance_t2v(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                seed=seed,
-                verbose=verbose,
+        except Exception as enhance_err:
+            # Native fallback: preserve run stability even if enhancer fails.
+            prompt = original_prompt
+            print(
+                f"{Colors.YELLOW}⚠️  Prompt enhancement failed; using original prompt: {enhance_err}{Colors.RESET}"
             )
-        print(
-            f"{Colors.DIM}Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}{Colors.RESET}"
-        )
+            # Structured token for host apps (e.g. GUI bridge) to show clear fallback reason.
+            print(
+                f"ENHANCER_FALLBACK:{type(enhance_err).__name__}:{enhance_err}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     # Get both video and audio embeddings
     video_embeddings, audio_embeddings = text_encoder(prompt)

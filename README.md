@@ -55,6 +55,7 @@ brew install ffmpeg
 
 > **Important:** The Gemma text encoder is required for normal generation embeddings (video/audio conditioning), even when prompt enhancement is disabled.  
 > Prompt enhancement is a separate optional step that rewrites the prompt text before generation.
+> If prompt enhancement fails, generation now falls back to the original prompt automatically.
 
 ## Usage
 

@@ -562,14 +562,17 @@ def load_vae_decoder(
 
     model_path = Path(model_path)
 
-    # Unified MLX format: model.safetensors with vae_decoder. prefix
-    if use_unified and (model_path / "model.safetensors").exists():
-        weights_path = model_path / "model.safetensors"
-        unified_prefix = "vae_decoder."
-    else:
-        unified_prefix = None
+    # Unified MLX format: single model.safetensors or split vae_decoder.safetensors
+    unified_prefix = None
+    weights_path = None
+    if use_unified:
+        if (model_path / "model.safetensors").exists():
+            weights_path = model_path / "model.safetensors"
+            unified_prefix = "vae_decoder."
+        elif (model_path / "vae_decoder.safetensors").exists():
+            weights_path = model_path / "vae_decoder.safetensors"
 
-    if unified_prefix is None:
+    if weights_path is None:
         # Try to find the weights file
         if model_path.is_file() and model_path.suffix == ".safetensors":
             weights_path = model_path

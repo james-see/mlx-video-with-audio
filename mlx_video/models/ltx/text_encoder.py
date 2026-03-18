@@ -722,16 +722,23 @@ class LTX2TextEncoder(nn.Module):
         self.language_model = LanguageModel.from_pretrained(text_encoder_path)
 
         # Load transformer weights for feature extractor and connector
-        if use_unified and (model_path / "model.safetensors").exists():
-            all_weights = mx.load(str(model_path / "model.safetensors"))
-            # Build transformer_weights in format expected below (connector keys)
+        connector_raw = None
+        if use_unified:
+            if (model_path / "model.safetensors").exists():
+                connector_raw = mx.load(str(model_path / "model.safetensors"))
+            elif (model_path / "connector.safetensors").exists():
+                connector_raw = mx.load(str(model_path / "connector.safetensors"))
+
+        if connector_raw is not None:
             transformer_weights = {}
-            for k, v in all_weights.items():
+            for k, v in connector_raw.items():
                 if k.startswith("connector."):
-                    # Map prefix only:
-                    # connector.video_embeddings_connector.* -> model.diffusion_model.video_embeddings_connector.*
-                    new_k = "model.diffusion_model." + k[len("connector.") :]
-                    transformer_weights[new_k] = v
+                    sub = k[len("connector."):]
+                    if sub.startswith("text_embedding_projection."):
+                        transformer_weights[sub] = v
+                    else:
+                        new_k = "model.diffusion_model." + sub
+                        transformer_weights[new_k] = v
                 elif k.startswith("text_embedding_projection."):
                     transformer_weights[k] = v
         else:

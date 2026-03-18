@@ -62,16 +62,40 @@ DEFAULT_UNIFIED_TEXT_ENCODER = "mlx-community/gemma-3-12b-it-bf16"
 def is_unified_mlx_model(model_path: Path) -> bool:
     """Check if model_path contains a unified MLX model.
 
-    Unified MLX models have:
-    - model.safetensors (single unified weights file)
-    - config.json
-    - No ltx-2-19b-distilled.safetensors (HuggingFace format)
+    Unified MLX models come in two layouts:
+    1. Single-file: model.safetensors + config.json
+    2. Split-weight: transformer.safetensors + vae_decoder.safetensors + config.json
+       with model_type "AudioVideo" (e.g. quantized/distilled repos)
+
+    Neither layout contains ltx-2-19b-distilled.safetensors (HuggingFace format).
     """
     model_path = Path(model_path)
-    has_unified = (model_path / "model.safetensors").exists()
     has_config = (model_path / "config.json").exists()
     has_hf_format = (model_path / "ltx-2-19b-distilled.safetensors").exists()
-    return has_unified and has_config and not has_hf_format
+    if not has_config or has_hf_format:
+        return False
+    has_single = (model_path / "model.safetensors").exists()
+    if has_single:
+        return True
+    split_manifest = model_path / "split_model.json"
+    if split_manifest.exists():
+        try:
+            with open(split_manifest, "r") as f:
+                manifest = json.load(f)
+            return manifest.get("format") == "split"
+        except (json.JSONDecodeError, OSError):
+            pass
+    has_split = (model_path / "transformer.safetensors").exists() and (
+        model_path / "vae_decoder.safetensors"
+    ).exists()
+    if has_split:
+        try:
+            with open(model_path / "config.json", "r") as f:
+                cfg = json.load(f)
+            return cfg.get("model_type") == "AudioVideo"
+        except (json.JSONDecodeError, OSError):
+            return False
+    return False
 
 
 def _looks_like_text_config(config_dict: dict) -> bool:
@@ -118,6 +142,11 @@ def validate_text_encoder_config(text_encoder_path: Path) -> None:
 def load_unified_weights(model_path: Path, prefix: str) -> dict:
     """Load weights from unified MLX model with given prefix.
 
+    Supports two layouts:
+    1. Single-file (model.safetensors): filter by prefix and strip it.
+    2. Split-weight (transformer.safetensors, vae_decoder.safetensors, etc.):
+       load the matching file directly — keys have no prefix.
+
     Args:
         model_path: Path to unified model directory
         prefix: Prefix to filter weights (e.g., 'transformer.', 'vae_decoder.')
@@ -125,8 +154,19 @@ def load_unified_weights(model_path: Path, prefix: str) -> dict:
     Returns:
         Dictionary of weights with prefix stripped
     """
-    all_weights = mx.load(str(model_path / "model.safetensors"))
-    return {k[len(prefix) :]: v for k, v in all_weights.items() if k.startswith(prefix)}
+    single_file = model_path / "model.safetensors"
+    if single_file.exists():
+        all_weights = mx.load(str(single_file))
+        return {
+            k[len(prefix):]: v
+            for k, v in all_weights.items()
+            if k.startswith(prefix)
+        }
+    split_name = prefix.rstrip(".")
+    split_file = model_path / f"{split_name}.safetensors"
+    if split_file.exists():
+        return mx.load(str(split_file))
+    return {}
 
 
 # Audio constants

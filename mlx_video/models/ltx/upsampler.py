@@ -344,13 +344,18 @@ def load_upsampler(weights_path: str, use_unified: bool = False) -> LatentUpsamp
     from pathlib import Path
 
     path = Path(weights_path)
-    if use_unified and path.is_dir() and (path / "model.safetensors").exists():
-        all_weights = mx.load(str(path / "model.safetensors"))
-        raw_weights = {
-            k: v for k, v in all_weights.items() if k.startswith("upsampler.")
-        }
-        if not raw_weights:
-            # Fallback: download just upsampler from Lightricks (~1GB, not full 150GB)
+    if use_unified and path.is_dir():
+        raw_weights = None
+        if (path / "model.safetensors").exists():
+            all_weights = mx.load(str(path / "model.safetensors"))
+            raw_weights = {
+                k: v for k, v in all_weights.items() if k.startswith("upsampler.")
+            }
+            if not raw_weights:
+                raw_weights = None
+        elif (path / "upsampler.safetensors").exists():
+            raw_weights = mx.load(str(path / "upsampler.safetensors"))
+        if raw_weights is None:
             from huggingface_hub import hf_hub_download
 
             print(

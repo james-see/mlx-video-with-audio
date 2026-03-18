@@ -17,6 +17,59 @@ def leaky_relu(x: mx.array, negative_slope: float = LRELU_SLOPE) -> mx.array:
     return mx.maximum(x, x * negative_slope)
 
 
+class _SnakeCore(nn.Module):
+    """Core SnakeBeta activation with learnable alpha/beta."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.alpha = mx.ones((channels,), dtype=mx.float32)
+        self.beta = mx.ones((channels,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # x is (B, L, C) for MLX Conv1d.
+        alpha = mx.reshape(self.alpha, (1, 1, -1))
+        beta = mx.reshape(self.beta, (1, 1, -1))
+        return x + (mx.sin(alpha * x) ** 2) / (beta + 1e-6)
+
+
+class _SnakeFilter(nn.Module):
+    """Container for anti-aliased filter weights in pretrained checkpoints."""
+
+    def __init__(self, taps: int = 12):
+        super().__init__()
+        self.filter = mx.zeros((1, 1, taps), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # Runtime path currently keeps filtering as a no-op, but weights are loaded.
+        return x
+
+
+class _SnakeDownsample(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lowpass = _SnakeFilter()
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.lowpass(x)
+
+
+class SnakeBeta(nn.Module):
+    """BigVGAN-style SnakeBeta activation wrapper."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.act = _SnakeCore(channels)
+        self.upsample = _SnakeFilter()
+        self.downsample = _SnakeDownsample()
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # Preserve learned parameters and submodules for checkpoint compatibility.
+        x = self.upsample(x)
+        x = self.act(x)
+        x = self.downsample(x)
+        return x
+
+
 class ResBlock1(nn.Module):
     """1D ResNet block for vocoder with dilated convolutions."""
 
@@ -60,6 +113,52 @@ class ResBlock1(nn.Module):
             xt = leaky_relu(x, LRELU_SLOPE)
             xt = self.convs1[i](xt)
             xt = leaky_relu(xt, LRELU_SLOPE)
+            xt = self.convs2[i](xt)
+            x = xt + x
+        return x
+
+
+class AMPBlock1(nn.Module):
+    """BigVGAN AMP1 residual block using SnakeBeta activations."""
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 3,
+        dilation: Tuple[int, int, int] = (1, 3, 5),
+    ):
+        super().__init__()
+
+        self.convs1 = {
+            i: nn.Conv1d(
+                channels,
+                channels,
+                kernel_size,
+                stride=1,
+                dilation=d,
+                padding=(kernel_size - 1) * d // 2,
+            )
+            for i, d in enumerate(dilation)
+        }
+        self.convs2 = {
+            i: nn.Conv1d(
+                channels,
+                channels,
+                kernel_size,
+                stride=1,
+                dilation=1,
+                padding=(kernel_size - 1) // 2,
+            )
+            for i in range(len(dilation))
+        }
+        self.acts1 = {i: SnakeBeta(channels) for i in range(len(dilation))}
+        self.acts2 = {i: SnakeBeta(channels) for i in range(len(dilation))}
+
+    def __call__(self, x: mx.array) -> mx.array:
+        for i in range(len(self.convs1)):
+            xt = self.acts1[i](x)
+            xt = self.convs1[i](xt)
+            xt = self.acts2[i](xt)
             xt = self.convs2[i](xt)
             x = xt + x
         return x
@@ -125,7 +224,11 @@ class ResnetBlock(nn.Module):
 
         self.norm1 = build_normalization_layer(in_channels, normtype=norm_type)
         self.conv1 = make_conv2d(
-            in_channels, out_channels, kernel_size=3, stride=1, causality_axis=causality_axis
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            causality_axis=causality_axis,
         )
 
         if temb_channels > 0:
@@ -134,17 +237,29 @@ class ResnetBlock(nn.Module):
         self.norm2 = build_normalization_layer(out_channels, normtype=norm_type)
         self.dropout_rate = dropout
         self.conv2 = make_conv2d(
-            out_channels, out_channels, kernel_size=3, stride=1, causality_axis=causality_axis
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            causality_axis=causality_axis,
         )
 
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = make_conv2d(
-                    in_channels, out_channels, kernel_size=3, stride=1, causality_axis=causality_axis
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=1,
+                    causality_axis=causality_axis,
                 )
             else:
                 self.nin_shortcut = make_conv2d(
-                    in_channels, out_channels, kernel_size=1, stride=1, causality_axis=causality_axis
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    causality_axis=causality_axis,
                 )
 
     def __call__(
@@ -168,7 +283,9 @@ class ResnetBlock(nn.Module):
         if temb is not None and self.temb_channels > 0:
             # temb: (B, temb_channels) -> (B, out_channels)
             # Need to add spatial dims: (B, 1, 1, out_channels) for broadcasting
-            h = h + mx.expand_dims(mx.expand_dims(nn.silu(self.temb_proj(temb)), axis=1), axis=1)
+            h = h + mx.expand_dims(
+                mx.expand_dims(nn.silu(self.temb_proj(temb)), axis=1), axis=1
+            )
 
         h = self.norm2(h)
         h = nn.silu(h)

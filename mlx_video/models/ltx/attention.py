@@ -65,6 +65,7 @@ class Attention(nn.Module):
         context_dim: Optional[int] = None,
         heads: int = 8,
         dim_head: int = 64,
+        apply_gated_attention: bool = False,
         norm_eps: float = 1e-6,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
     ):
@@ -98,6 +99,11 @@ class Attention(nn.Module):
 
         # Output projection
         self.to_out = nn.Linear(inner_dim, query_dim, bias=True)
+
+        # Optional per-head gating for distilled checkpoints.
+        self.to_gate_logits: Optional[nn.Linear] = (
+            nn.Linear(query_dim, heads, bias=True) if apply_gated_attention else None
+        )
 
     def __call__(
         self,
@@ -137,6 +143,14 @@ class Attention(nn.Module):
 
         # Compute attention
         out = scaled_dot_product_attention(q, k, v, self.heads, mask)
+
+        # Apply per-head gating if available
+        if self.to_gate_logits is not None:
+            B, S, _ = x.shape
+            gates = mx.sigmoid(self.to_gate_logits(x))
+            gates = mx.expand_dims(gates, axis=-1)
+            out_reshaped = out.reshape(B, S, self.heads, self.dim_head)
+            out = (out_reshaped * gates).reshape(B, S, -1)
 
         # Project output
         return self.to_out(out)

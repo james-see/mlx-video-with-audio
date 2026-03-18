@@ -1,4 +1,3 @@
-
 import inspect
 from dataclasses import dataclass, field
 from enum import Enum
@@ -22,8 +21,10 @@ class LTXRopeType(Enum):
     SPLIT = "split"
     TWO_D = "2d"
 
+
 class AttentionType(Enum):
     DEFAULT = "default"
+
 
 @dataclass
 class BaseModelConfig:
@@ -46,7 +47,7 @@ class BaseModelConfig:
             if v is not None:
                 if isinstance(v, Enum):
                     result[k] = v.value
-                elif hasattr(v, 'to_dict'):
+                elif hasattr(v, "to_dict"):
                     result[k] = v.to_dict()
                 else:
                     result[k] = v
@@ -59,6 +60,7 @@ class TransformerConfig(BaseModelConfig):
     heads: int
     d_head: int
     context_dim: int
+    apply_gated_attention: bool = False
 
 
 @dataclass
@@ -68,26 +70,30 @@ class VideoVAEConfig(BaseModelConfig):
     out_channels: int = 128
     latent_channels: int = 128
     patch_size: int = 4
-    encoder_blocks: List[tuple] = field(default_factory=lambda: [
-        ("res_x", {"num_layers": 4}),
-        ("compress_space_res", {"multiplier": 2}),
-        ("res_x", {"num_layers": 6}),
-        ("compress_time_res", {"multiplier": 2}),
-        ("res_x", {"num_layers": 6}),
-        ("compress_all_res", {"multiplier": 2}),
-        ("res_x", {"num_layers": 2}),
-        ("compress_all_res", {"multiplier": 2}),
-        ("res_x", {"num_layers": 2}),
-    ])
-    decoder_blocks: List[tuple] = field(default_factory=lambda: [
-        ("res_x", {"num_layers": 5, "inject_noise": False}),
-        ("compress_all", {"residual": True, "multiplier": 2}),
-        ("res_x", {"num_layers": 5, "inject_noise": False}),
-        ("compress_all", {"residual": True, "multiplier": 2}),
-        ("res_x", {"num_layers": 5, "inject_noise": False}),
-        ("compress_all", {"residual": True, "multiplier": 2}),
-        ("res_x", {"num_layers": 5, "inject_noise": False}),
-    ])
+    encoder_blocks: List[tuple] = field(
+        default_factory=lambda: [
+            ("res_x", {"num_layers": 4}),
+            ("compress_space_res", {"multiplier": 2}),
+            ("res_x", {"num_layers": 6}),
+            ("compress_time_res", {"multiplier": 2}),
+            ("res_x", {"num_layers": 6}),
+            ("compress_all_res", {"multiplier": 2}),
+            ("res_x", {"num_layers": 2}),
+            ("compress_all_res", {"multiplier": 2}),
+            ("res_x", {"num_layers": 2}),
+        ]
+    )
+    decoder_blocks: List[tuple] = field(
+        default_factory=lambda: [
+            ("res_x", {"num_layers": 5, "inject_noise": False}),
+            ("compress_all", {"residual": True, "multiplier": 2}),
+            ("res_x", {"num_layers": 5, "inject_noise": False}),
+            ("compress_all", {"residual": True, "multiplier": 2}),
+            ("res_x", {"num_layers": 5, "inject_noise": False}),
+            ("compress_all", {"residual": True, "multiplier": 2}),
+            ("res_x", {"num_layers": 5, "inject_noise": False}),
+        ]
+    )
 
 
 @dataclass
@@ -104,6 +110,10 @@ class LTXModelConfig(BaseModelConfig):
     num_layers: int = 48
     cross_attention_dim: int = 4096
     caption_channels: int = 3840
+    caption_projection_first_linear: bool = True
+    caption_projection_second_linear: bool = True
+    adaln_embedding_coefficient: int = 6
+    apply_gated_attention: bool = False
 
     # Audio transformer config
     audio_num_attention_heads: int = 32
@@ -111,7 +121,9 @@ class LTXModelConfig(BaseModelConfig):
     audio_in_channels: int = 128
     audio_out_channels: int = 128
     audio_cross_attention_dim: int = 2048
-    audio_caption_channels: int = 3840  # Input dim for audio text embeddings (same as video)
+    audio_caption_channels: int = (
+        3840  # Input dim for audio text embeddings (same as video)
+    )
 
     # Positional embedding config
     positional_embedding_theta: float = 10000.0
@@ -168,6 +180,7 @@ class LTXModelConfig(BaseModelConfig):
             heads=self.num_attention_heads,
             d_head=self.attention_head_dim,
             context_dim=self.cross_attention_dim,
+            apply_gated_attention=self.apply_gated_attention,
         )
 
     def get_audio_config(self) -> Optional[TransformerConfig]:
@@ -179,4 +192,5 @@ class LTXModelConfig(BaseModelConfig):
             heads=self.audio_num_attention_heads,
             d_head=self.audio_attention_head_dim,
             context_dim=self.audio_cross_attention_dim,
+            apply_gated_attention=self.apply_gated_attention,
         )

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from tqdm import tqdm
 
@@ -98,6 +99,21 @@ def is_unified_mlx_model(model_path: Path) -> bool:
     return False
 
 
+def unified_vae_layout_supported(model_path: Path) -> bool:
+    """Return whether unified repo VAE layout matches current decoder implementation."""
+    embedded_cfg_path = model_path / "embedded_config.json"
+    if not embedded_cfg_path.exists():
+        return True
+    try:
+        with open(embedded_cfg_path, "r") as f:
+            vae_cfg = json.load(f).get("vae", {})
+        decoder_blocks = vae_cfg.get("decoder_blocks")
+        # Current MLX decoder implementation supports the classic 7-stage decoder.
+        return not isinstance(decoder_blocks, list) or len(decoder_blocks) == 7
+    except (json.JSONDecodeError, OSError):
+        return True
+
+
 def _looks_like_text_config(config_dict: dict) -> bool:
     required = {
         "hidden_size",
@@ -158,14 +174,16 @@ def load_unified_weights(model_path: Path, prefix: str) -> dict:
     if single_file.exists():
         all_weights = mx.load(str(single_file))
         return {
-            k[len(prefix):]: v
-            for k, v in all_weights.items()
-            if k.startswith(prefix)
+            k[len(prefix) :]: v for k, v in all_weights.items() if k.startswith(prefix)
         }
     split_name = prefix.rstrip(".")
     split_file = model_path / f"{split_name}.safetensors"
     if split_file.exists():
-        return mx.load(str(split_file))
+        raw = mx.load(str(split_file))
+        stripped = {}
+        for k, v in raw.items():
+            stripped[k[len(prefix) :] if k.startswith(prefix) else k] = v
+        return stripped
     return {}
 
 
@@ -464,22 +482,86 @@ def load_vocoder(model_path: Path, use_unified: bool = False):
         model_path: Path to model directory
         use_unified: If True, load from unified MLX format
     """
-    from mlx_video.models.ltx.audio_vae import Vocoder
+    from mlx_video.models.ltx.audio_vae import BigVGANVocoder, Vocoder
 
-    vocoder = Vocoder(
-        resblock_kernel_sizes=[3, 7, 11],
-        upsample_rates=[6, 5, 2, 2, 2],
-        upsample_kernel_sizes=[16, 15, 8, 4, 4],
-        resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-        upsample_initial_channel=1024,
-        stereo=True,
-        output_sample_rate=AUDIO_SAMPLE_RATE,
-    )
+    resblock_kernel_sizes = [3, 7, 11]
+    upsample_rates = [6, 5, 2, 2, 2]
+    upsample_kernel_sizes = [16, 15, 8, 4, 4]
+    resblock_dilation_sizes = [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
+    upsample_initial_channel = 1024
+    vocoder_resblock = "1"
+    vocoder_activation = "leaky_relu"
+    use_tanh_at_final = True
+    use_bias_at_final = True
+    embedded_cfg_path = model_path / "embedded_config.json"
+    if embedded_cfg_path.exists():
+        try:
+            with open(embedded_cfg_path, "r") as f:
+                voc_cfg = json.load(f).get("vocoder", {}).get("vocoder", {})
+            if voc_cfg:
+                upsample_initial_channel = voc_cfg.get(
+                    "upsample_initial_channel", upsample_initial_channel
+                )
+                upsample_rates = voc_cfg.get("upsample_rates", upsample_rates)
+                upsample_kernel_sizes = voc_cfg.get(
+                    "upsample_kernel_sizes", upsample_kernel_sizes
+                )
+                resblock_kernel_sizes = voc_cfg.get(
+                    "resblock_kernel_sizes", resblock_kernel_sizes
+                )
+                resblock_dilation_sizes = voc_cfg.get(
+                    "resblock_dilation_sizes", resblock_dilation_sizes
+                )
+                vocoder_resblock = str(voc_cfg.get("resblock", vocoder_resblock))
+                vocoder_activation = str(
+                    voc_cfg.get("activation", vocoder_activation)
+                ).lower()
+                use_tanh_at_final = bool(
+                    voc_cfg.get("use_tanh_at_final", use_tanh_at_final)
+                )
+                use_bias_at_final = bool(
+                    voc_cfg.get("use_bias_at_final", use_bias_at_final)
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if vocoder_activation == "snakebeta" or vocoder_resblock.upper() == "AMP1":
+        vocoder = BigVGANVocoder(
+            resblock_kernel_sizes=resblock_kernel_sizes,
+            upsample_rates=upsample_rates,
+            upsample_kernel_sizes=upsample_kernel_sizes,
+            resblock_dilation_sizes=resblock_dilation_sizes,
+            upsample_initial_channel=upsample_initial_channel,
+            stereo=True,
+            output_sample_rate=AUDIO_SAMPLE_RATE,
+            use_tanh_at_final=use_tanh_at_final,
+            use_bias_at_final=use_bias_at_final,
+        )
+    else:
+        vocoder = Vocoder(
+            resblock_kernel_sizes=resblock_kernel_sizes,
+            upsample_rates=upsample_rates,
+            upsample_kernel_sizes=upsample_kernel_sizes,
+            resblock_dilation_sizes=resblock_dilation_sizes,
+            upsample_initial_channel=upsample_initial_channel,
+            stereo=True,
+            output_sample_rate=AUDIO_SAMPLE_RATE,
+        )
 
     if use_unified:
         # Load from unified MLX model (weights already sanitized)
         sanitized = load_unified_weights(model_path, "vocoder.")
         if sanitized:
+            # Distilled split vocoder uses PyTorch layout for ConvTranspose1d upsamplers
+            # while other conv weights are already MLX-compatible.
+            fixed = {}
+            for key, value in sanitized.items():
+                if value.ndim == 3 and (
+                    key.startswith("ups.") or key.startswith("bwe_generator.ups.")
+                ):
+                    value = mx.transpose(value, (1, 2, 0))
+                fixed[key] = value
+            sanitized = fixed
             vocoder.load_weights(list(sanitized.items()), strict=False)
     else:
         # Load from HuggingFace format (needs sanitization)
@@ -633,6 +715,13 @@ def generate_video_with_audio(
         text_encoder_path = get_model_path(
             text_encoder_repo or DEFAULT_UNIFIED_TEXT_ENCODER
         )
+        vae_model_path = model_path
+        if not unified_vae_layout_supported(model_path):
+            print(
+                f"{Colors.DIM}Unified VAE layout not yet supported; "
+                f"falling back to {DEFAULT_HF_MODEL} VAE{Colors.RESET}"
+            )
+            vae_model_path = get_model_path(DEFAULT_HF_MODEL)
     else:
         text_encoder_path = (
             model_path
@@ -640,6 +729,7 @@ def generate_video_with_audio(
             else get_model_path(text_encoder_repo)
         )
         hf_model_path = model_path  # For upsampler, VAE, etc.
+        vae_model_path = model_path
 
     print(f"RESOLVE:MODEL_PATH:{model_path}", file=sys.stderr, flush=True)
     print(f"RESOLVE:USE_UNIFIED:{use_unified}", file=sys.stderr, flush=True)
@@ -742,6 +832,39 @@ def generate_video_with_audio(
             for k, v in sanitized.items()
         }
 
+    caption_channels = 3840
+    audio_caption_channels = 3840
+    caption_proj_first = True
+    caption_proj_second = True
+    apply_gated_attention = False
+    adaln_embedding_coefficient = 6
+    embedded_cfg_path = model_path / "embedded_config.json"
+    if embedded_cfg_path.exists():
+        try:
+            with open(embedded_cfg_path, "r") as f:
+                t_cfg = json.load(f).get("transformer", {})
+            caption_proj_first = t_cfg.get("caption_projection_first_linear", True)
+            caption_proj_second = t_cfg.get("caption_projection_second_linear", True)
+            apply_gated_attention = bool(t_cfg.get("apply_gated_attention", False))
+            adaln_embedding_coefficient = 9 if apply_gated_attention else 6
+            no_caption_proj = not caption_proj_first and not caption_proj_second
+            if no_caption_proj:
+                conn_heads = t_cfg.get("connector_num_attention_heads", 32)
+                conn_head_dim = t_cfg.get("connector_attention_head_dim", 128)
+                caption_channels = conn_heads * conn_head_dim
+                audio_conn_heads = t_cfg.get("audio_connector_num_attention_heads", 32)
+                audio_conn_head_dim = t_cfg.get(
+                    "audio_connector_attention_head_dim", 64
+                )
+                audio_caption_channels = audio_conn_heads * audio_conn_head_dim
+            else:
+                caption_channels = t_cfg.get("caption_channels", caption_channels)
+                audio_caption_channels = t_cfg.get(
+                    "audio_caption_channels", audio_caption_channels
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+
     config = LTXModelConfig(
         model_type=LTXModelType.AudioVideo,
         num_attention_heads=32,
@@ -750,13 +873,18 @@ def generate_video_with_audio(
         out_channels=128,
         num_layers=48,
         cross_attention_dim=4096,
-        caption_channels=3840,
+        caption_channels=caption_channels,
+        caption_projection_first_linear=caption_proj_first,
+        caption_projection_second_linear=caption_proj_second,
+        adaln_embedding_coefficient=adaln_embedding_coefficient,
+        apply_gated_attention=apply_gated_attention,
         # Audio config
         audio_num_attention_heads=32,
         audio_attention_head_dim=64,
         audio_in_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,  # 8 * 16 = 128
         audio_out_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,
         audio_cross_attention_dim=2048,
+        audio_caption_channels=audio_caption_channels,
         rope_type=LTXRopeType.SPLIT,
         double_precision_rope=True,
         positional_embedding_theta=10000.0,
@@ -767,6 +895,32 @@ def generate_video_with_audio(
     )
 
     transformer = LTXModel(config)
+
+    # Detect quantized model and selectively quantize layers that have quantized weights
+    split_manifest = model_path / "split_model.json"
+    if split_manifest.exists():
+        try:
+            with open(split_manifest, "r") as f:
+                manifest = json.load(f)
+            if manifest.get("quantized", False):
+                q_bits = manifest.get("quantization_bits", 4)
+                q_group = manifest.get("quantization_group_size", 64)
+                quantized_paths = {
+                    k.rsplit(".", 1)[0] for k in sanitized if k.endswith(".scales")
+                }
+
+                def _should_quantize(path: str, module: nn.Module) -> bool:
+                    return isinstance(module, nn.Linear) and path in quantized_paths
+
+                nn.quantize(
+                    transformer,
+                    group_size=q_group,
+                    bits=q_bits,
+                    class_predicate=_should_quantize,
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+
     transformer.load_weights(list(sanitized.items()), strict=False)
     mx.eval(transformer.parameters())
 
@@ -779,11 +933,11 @@ def generate_video_with_audio(
         )
         vae_encoder = load_vae_encoder(
             (
-                str(hf_model_path / "ltx-2-19b-distilled.safetensors")
-                if not use_unified
+                str(vae_model_path / "ltx-2-19b-distilled.safetensors")
+                if (not use_unified or vae_model_path != model_path)
                 else str(model_path)
             ),
-            use_unified=use_unified,
+            use_unified=use_unified and (vae_model_path == model_path),
         )
         mx.eval(vae_encoder.parameters())
 
@@ -891,12 +1045,12 @@ def generate_video_with_audio(
 
     vae_decoder = load_vae_decoder(
         (
-            str(hf_model_path / "ltx-2-19b-distilled.safetensors")
-            if not use_unified
+            str(vae_model_path / "ltx-2-19b-distilled.safetensors")
+            if (not use_unified or vae_model_path != model_path)
             else str(model_path)
         ),
         timestep_conditioning=None,
-        use_unified=use_unified,
+        use_unified=use_unified and (vae_model_path == model_path),
     )
 
     video_latents = upsample_latents(

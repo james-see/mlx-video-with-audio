@@ -26,6 +26,7 @@ class TransformerArgsPreprocessor:
         self,
         patchify_proj: nn.Linear,
         adaln: AdaLayerNormSingle,
+        prompt_adaln: Optional[AdaLayerNormSingle],
         caption_projection: PixArtAlphaTextProjection,
         inner_dim: int,
         max_pos: List[int],
@@ -38,6 +39,7 @@ class TransformerArgsPreprocessor:
     ):
         self.patchify_proj = patchify_proj
         self.adaln = adaln
+        self.prompt_adaln = prompt_adaln
         self.caption_projection = caption_projection
         self.inner_dim = inner_dim
         self.max_pos = max_pos
@@ -56,11 +58,17 @@ class TransformerArgsPreprocessor:
     ) -> Tuple[mx.array, mx.array]:
 
         timestep = timestep * self.timestep_scale_multiplier
-        timestep_emb, embedded_timestep = self.adaln(timestep.reshape(-1), hidden_dtype=hidden_dtype)
+        timestep_emb, embedded_timestep = self.adaln(
+            timestep.reshape(-1), hidden_dtype=hidden_dtype
+        )
 
         # Reshape to (batch, tokens, dim)
-        timestep_emb = mx.reshape(timestep_emb, (batch_size, -1, timestep_emb.shape[-1]))
-        embedded_timestep = mx.reshape(embedded_timestep, (batch_size, -1, embedded_timestep.shape[-1]))
+        timestep_emb = mx.reshape(
+            timestep_emb, (batch_size, -1, timestep_emb.shape[-1])
+        )
+        embedded_timestep = mx.reshape(
+            embedded_timestep, (batch_size, -1, embedded_timestep.shape[-1])
+        )
 
         return timestep_emb, embedded_timestep
 
@@ -93,7 +101,9 @@ class TransformerArgsPreprocessor:
         # Convert boolean/int mask to float mask
         # 0 -> -inf (masked), 1 -> 0 (not masked)
         mask = (attention_mask.astype(x_dtype) - 1) * 1e9
-        mask = mx.reshape(mask, (attention_mask.shape[0], 1, -1, attention_mask.shape[-1]))
+        mask = mx.reshape(
+            mask, (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
+        )
         return mask
 
     def _prepare_positional_embeddings(
@@ -118,9 +128,24 @@ class TransformerArgsPreprocessor:
 
     def prepare(self, modality: Modality) -> TransformerArgs:
         x = self.patchify_proj(modality.latent)
-        timestep, embedded_timestep = self._prepare_timestep(modality.timesteps, x.shape[0], hidden_dtype=x.dtype)
-        context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
-        attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
+        timestep, embedded_timestep = self._prepare_timestep(
+            modality.timesteps, x.shape[0], hidden_dtype=x.dtype
+        )
+        prompt_timestep = None
+        if self.prompt_adaln is not None:
+            prompt_timestep, _ = self.prompt_adaln(
+                (modality.timesteps * self.timestep_scale_multiplier).reshape(-1),
+                hidden_dtype=x.dtype,
+            )
+            prompt_timestep = mx.reshape(
+                prompt_timestep, (x.shape[0], -1, prompt_timestep.shape[-1])
+            )
+        context, attention_mask = self._prepare_context(
+            modality.context, x, modality.context_mask
+        )
+        attention_mask = self._prepare_attention_mask(
+            attention_mask, modality.latent.dtype
+        )
         pe = self._prepare_positional_embeddings(
             positions=modality.positions,
             inner_dim=self.inner_dim,
@@ -139,6 +164,7 @@ class TransformerArgsPreprocessor:
             cross_positional_embeddings=None,
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
+            prompt_timestep=prompt_timestep,
             enabled=modality.enabled,
         )
 
@@ -149,6 +175,7 @@ class MultiModalTransformerArgsPreprocessor:
         self,
         patchify_proj: nn.Linear,
         adaln: AdaLayerNormSingle,
+        prompt_adaln: Optional[AdaLayerNormSingle],
         caption_projection: PixArtAlphaTextProjection,
         cross_scale_shift_adaln: AdaLayerNormSingle,
         cross_gate_adaln: AdaLayerNormSingle,
@@ -167,6 +194,7 @@ class MultiModalTransformerArgsPreprocessor:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
             adaln=adaln,
+            prompt_adaln=prompt_adaln,
             caption_projection=caption_projection,
             inner_dim=inner_dim,
             max_pos=max_pos,
@@ -198,11 +226,13 @@ class MultiModalTransformerArgsPreprocessor:
         )
 
         # Prepare cross-attention timestep embeddings
-        cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
-            timestep=modality.timesteps,
-            timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
-            batch_size=transformer_args.x.shape[0],
-            hidden_dtype=transformer_args.x.dtype,
+        cross_scale_shift_timestep, cross_gate_timestep = (
+            self._prepare_cross_attention_timestep(
+                timestep=modality.timesteps,
+                timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
+                batch_size=transformer_args.x.shape[0],
+                hidden_dtype=transformer_args.x.dtype,
+            )
         )
 
         return replace(
@@ -223,17 +253,25 @@ class MultiModalTransformerArgsPreprocessor:
 
         av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
-        scale_shift_timestep, _ = self.cross_scale_shift_adaln(timestep.reshape(-1), hidden_dtype=hidden_dtype)
-        scale_shift_timestep = mx.reshape(scale_shift_timestep, (batch_size, -1, scale_shift_timestep.shape[-1]))
+        scale_shift_timestep, _ = self.cross_scale_shift_adaln(
+            timestep.reshape(-1), hidden_dtype=hidden_dtype
+        )
+        scale_shift_timestep = mx.reshape(
+            scale_shift_timestep, (batch_size, -1, scale_shift_timestep.shape[-1])
+        )
 
-        gate_timestep, _ = self.cross_gate_adaln(timestep.reshape(-1) * av_ca_factor, hidden_dtype=hidden_dtype)
-        gate_timestep = mx.reshape(gate_timestep, (batch_size, -1, gate_timestep.shape[-1]))
+        gate_timestep, _ = self.cross_gate_adaln(
+            timestep.reshape(-1) * av_ca_factor, hidden_dtype=hidden_dtype
+        )
+        gate_timestep = mx.reshape(
+            gate_timestep, (batch_size, -1, gate_timestep.shape[-1])
+        )
 
         return scale_shift_timestep, gate_timestep
 
 
 class LTXModel(nn.Module):
- 
+
     def __init__(self, config: LTXModelConfig):
 
         super().__init__()
@@ -254,18 +292,25 @@ class LTXModel(nn.Module):
             self._init_video(config)
 
         if config.model_type.is_audio_enabled():
-            self.audio_positional_embedding_max_pos = config.audio_positional_embedding_max_pos
+            self.audio_positional_embedding_max_pos = (
+                config.audio_positional_embedding_max_pos
+            )
             self.audio_num_attention_heads = config.audio_num_attention_heads
             self.audio_inner_dim = config.audio_inner_dim
             self._init_audio(config)
 
         # Initialize cross-modal components
-        if config.model_type.is_video_enabled() and config.model_type.is_audio_enabled():
+        if (
+            config.model_type.is_video_enabled()
+            and config.model_type.is_audio_enabled()
+        ):
             cross_pe_max_pos = max(
                 config.positional_embedding_max_pos[0],
                 config.audio_positional_embedding_max_pos[0],
             )
-            self.av_ca_timestep_scale_multiplier = config.av_ca_timestep_scale_multiplier
+            self.av_ca_timestep_scale_multiplier = (
+                config.av_ca_timestep_scale_multiplier
+            )
             self.audio_cross_attention_dim = config.audio_cross_attention_dim
             self._init_audio_video(config)
 
@@ -275,29 +320,60 @@ class LTXModel(nn.Module):
 
     def _init_video(self, config: LTXModelConfig) -> None:
         self.patchify_proj = nn.Linear(config.in_channels, self.inner_dim, bias=True)
-        self.adaln_single = AdaLayerNormSingle(self.inner_dim)
-        self.caption_projection = PixArtAlphaTextProjection(
-            in_features=config.caption_channels,
-            hidden_size=self.inner_dim,
+        self.adaln_single = AdaLayerNormSingle(
+            self.inner_dim,
+            embedding_coefficient=config.adaln_embedding_coefficient,
         )
+        self.prompt_adaln_single = (
+            AdaLayerNormSingle(self.inner_dim, embedding_coefficient=2)
+            if config.apply_gated_attention
+            else None
+        )
+        if (
+            config.caption_projection_first_linear
+            and config.caption_projection_second_linear
+        ):
+            self.caption_projection = PixArtAlphaTextProjection(
+                in_features=config.caption_channels,
+                hidden_size=self.inner_dim,
+            )
+        else:
+            self.caption_projection = nn.Identity()
 
         self.scale_shift_table = mx.zeros((2, self.inner_dim))
         self.norm_out = nn.LayerNorm(self.inner_dim, eps=config.norm_eps, affine=False)
         self.proj_out = nn.Linear(self.inner_dim, config.out_channels)
 
     def _init_audio(self, config: LTXModelConfig) -> None:
-        self.audio_patchify_proj = nn.Linear(config.audio_in_channels, self.audio_inner_dim, bias=True)
-        self.audio_adaln_single = AdaLayerNormSingle(self.audio_inner_dim)
-
-        # Audio caption projection: receives pre-processed embeddings from text encoder's audio_embeddings_connector
-        self.audio_caption_projection = PixArtAlphaTextProjection(
-            in_features=config.audio_caption_channels,
-            hidden_size=self.audio_inner_dim,
+        self.audio_patchify_proj = nn.Linear(
+            config.audio_in_channels, self.audio_inner_dim, bias=True
         )
+        self.audio_adaln_single = AdaLayerNormSingle(
+            self.audio_inner_dim,
+            embedding_coefficient=config.adaln_embedding_coefficient,
+        )
+        self.audio_prompt_adaln_single = (
+            AdaLayerNormSingle(self.audio_inner_dim, embedding_coefficient=2)
+            if config.apply_gated_attention
+            else None
+        )
+
+        if (
+            config.caption_projection_first_linear
+            and config.caption_projection_second_linear
+        ):
+            self.audio_caption_projection = PixArtAlphaTextProjection(
+                in_features=config.audio_caption_channels,
+                hidden_size=self.audio_inner_dim,
+            )
+        else:
+            self.audio_caption_projection = nn.Identity()
 
         # Output components
         self.audio_scale_shift_table = mx.zeros((2, self.audio_inner_dim))
-        self.audio_norm_out = nn.LayerNorm(self.audio_inner_dim, eps=config.norm_eps, affine=False)
+        self.audio_norm_out = nn.LayerNorm(
+            self.audio_inner_dim, eps=config.norm_eps, affine=False
+        )
         self.audio_proj_out = nn.Linear(self.audio_inner_dim, config.audio_out_channels)
 
     def _init_audio_video(self, config: LTXModelConfig) -> None:
@@ -320,12 +396,18 @@ class LTXModel(nn.Module):
             embedding_coefficient=1,
         )
 
-    def _init_preprocessors(self, config: LTXModelConfig, cross_pe_max_pos: Optional[int]) -> None:
-        if config.model_type.is_video_enabled() and config.model_type.is_audio_enabled():
+    def _init_preprocessors(
+        self, config: LTXModelConfig, cross_pe_max_pos: Optional[int]
+    ) -> None:
+        if (
+            config.model_type.is_video_enabled()
+            and config.model_type.is_audio_enabled()
+        ):
             # Multi-modal preprocessors
             self.video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
+                prompt_adaln=self.prompt_adaln_single,
                 caption_projection=self.caption_projection,
                 cross_scale_shift_adaln=self.av_ca_video_scale_shift_adaln_single,
                 cross_gate_adaln=self.av_ca_a2v_gate_adaln_single,
@@ -344,6 +426,7 @@ class LTXModel(nn.Module):
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
+                prompt_adaln=self.audio_prompt_adaln_single,
                 caption_projection=self.audio_caption_projection,
                 cross_scale_shift_adaln=self.av_ca_audio_scale_shift_adaln_single,
                 cross_gate_adaln=self.av_ca_v2a_gate_adaln_single,
@@ -363,6 +446,7 @@ class LTXModel(nn.Module):
             self.video_args_preprocessor = TransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
+                prompt_adaln=self.prompt_adaln_single,
                 caption_projection=self.caption_projection,
                 inner_dim=self.inner_dim,
                 max_pos=config.positional_embedding_max_pos,
@@ -377,6 +461,7 @@ class LTXModel(nn.Module):
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
+                prompt_adaln=self.audio_prompt_adaln_single,
                 caption_projection=self.audio_caption_projection,
                 inner_dim=self.audio_inner_dim,
                 max_pos=config.audio_positional_embedding_max_pos,
@@ -391,7 +476,6 @@ class LTXModel(nn.Module):
     def _init_transformer_blocks(self, config: LTXModelConfig) -> None:
         video_config = config.get_video_config()
         audio_config = config.get_audio_config()
-
 
         self.transformer_blocks = {
             idx: BasicAVTransformerBlock(
@@ -422,7 +506,7 @@ class LTXModel(nn.Module):
         x: mx.array,
         embedded_timestep: mx.array,
     ) -> mx.array:
-       
+
         # scale_shift_table: (2, dim) -> expand to (1, 1, 2, dim)
         # embedded_timestep: (B, 1, dim) -> expand to (B, 1, 1, dim)
         table_expanded = scale_shift_table[None, None, :, :]  # (1, 1, 2, dim)
@@ -446,7 +530,7 @@ class LTXModel(nn.Module):
         video: Optional[Modality] = None,
         audio: Optional[Modality] = None,
     ) -> Tuple[Optional[mx.array], Optional[mx.array]]:
-       
+
         # Validate inputs
         if not self.model_type.is_video_enabled() and video is not None:
             raise ValueError("Video is not enabled for this model")
@@ -454,8 +538,12 @@ class LTXModel(nn.Module):
             raise ValueError("Audio is not enabled for this model")
 
         # Preprocess arguments
-        video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
-        audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+        video_args = (
+            self.video_args_preprocessor.prepare(video) if video is not None else None
+        )
+        audio_args = (
+            self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+        )
 
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
@@ -509,7 +597,7 @@ class LTXModel(nn.Module):
 class X0Model(nn.Module):
 
     def __init__(self, velocity_model: LTXModel):
-        
+
         super().__init__()
         self.velocity_model = velocity_model
 
@@ -518,10 +606,14 @@ class X0Model(nn.Module):
         video: Optional[Modality] = None,
         audio: Optional[Modality] = None,
     ) -> Tuple[Optional[mx.array], Optional[mx.array]]:
-       
+
         vx, ax = self.velocity_model(video, audio)
 
-        denoised_video = to_denoised(video.latent, vx, video.timesteps) if vx is not None else None
-        denoised_audio = to_denoised(audio.latent, ax, audio.timesteps) if ax is not None else None
+        denoised_video = (
+            to_denoised(video.latent, vx, video.timesteps) if vx is not None else None
+        )
+        denoised_audio = (
+            to_denoised(audio.latent, ax, audio.timesteps) if ax is not None else None
+        )
 
         return denoised_video, denoised_audio

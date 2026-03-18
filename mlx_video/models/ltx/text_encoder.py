@@ -684,6 +684,7 @@ class LTX2TextEncoder(nn.Module):
             input_dim=hidden_dim * num_layers,
             output_dim=hidden_dim,
         )
+        self.audio_feature_extractor = None
 
         # Video embeddings connector: 2-layer transformer
         self.video_embeddings_connector = Embeddings1DConnector(
@@ -749,11 +750,73 @@ class LTX2TextEncoder(nn.Module):
 
         if transformer_weights:
 
-            # Load feature extractor (aggregate_embed)
-            if (
-                "text_embedding_projection.aggregate_embed.weight"
-                in transformer_weights
-            ):
+            # Re-create connectors if model has different architecture (e.g. 8-layer distilled)
+            if model_path and (model_path / "embedded_config.json").exists():
+                try:
+                    with open(model_path / "embedded_config.json", "r") as f:
+                        embedded_cfg = json.load(f).get("transformer", {})
+                    conn_layers = embedded_cfg.get("connector_num_layers", 2)
+                    conn_heads = embedded_cfg.get("connector_num_attention_heads", 30)
+                    conn_head_dim = embedded_cfg.get("connector_attention_head_dim", 128)
+                    conn_registers = embedded_cfg.get("connector_num_learnable_registers", 128)
+                    conn_max_pos = embedded_cfg.get("connector_positional_embedding_max_pos", [4096])
+                    audio_conn_heads = embedded_cfg.get("audio_connector_num_attention_heads", conn_heads)
+                    audio_conn_head_dim = embedded_cfg.get("audio_connector_attention_head_dim", conn_head_dim)
+                    if conn_layers != 2 or conn_heads != 30:
+                        self.video_embeddings_connector = Embeddings1DConnector(
+                            dim=self.hidden_dim,
+                            num_heads=conn_heads,
+                            head_dim=conn_head_dim,
+                            num_layers=conn_layers,
+                            num_learnable_registers=conn_registers,
+                            positional_embedding_max_pos=conn_max_pos,
+                        )
+                        self.audio_embeddings_connector = Embeddings1DConnector(
+                            dim=self.hidden_dim,
+                            num_heads=audio_conn_heads,
+                            head_dim=audio_conn_head_dim,
+                            num_layers=conn_layers,
+                            num_learnable_registers=conn_registers,
+                            positional_embedding_max_pos=conn_max_pos,
+                        )
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            # Load feature extractor(s)
+            if "text_embedding_projection.video_aggregate_embed.weight" in transformer_weights:
+                self.feature_extractor.aggregate_embed.weight = transformer_weights[
+                    "text_embedding_projection.video_aggregate_embed.weight"
+                ]
+                if "text_embedding_projection.video_aggregate_embed.bias" in transformer_weights:
+                    self.feature_extractor.aggregate_embed = nn.Linear(
+                        self.feature_extractor.aggregate_embed.weight.shape[1],
+                        self.feature_extractor.aggregate_embed.weight.shape[0],
+                        bias=True,
+                    )
+                    self.feature_extractor.aggregate_embed.weight = transformer_weights[
+                        "text_embedding_projection.video_aggregate_embed.weight"
+                    ]
+                    self.feature_extractor.aggregate_embed.bias = transformer_weights[
+                        "text_embedding_projection.video_aggregate_embed.bias"
+                    ]
+                if "text_embedding_projection.audio_aggregate_embed.weight" in transformer_weights:
+                    self.audio_feature_extractor = GemmaFeaturesExtractor(
+                        input_dim=self.hidden_dim * self.num_layers,
+                        output_dim=self.hidden_dim,
+                    )
+                    has_audio_bias = "text_embedding_projection.audio_aggregate_embed.bias" in transformer_weights
+                    if has_audio_bias:
+                        self.audio_feature_extractor.aggregate_embed = nn.Linear(
+                            self.hidden_dim * self.num_layers, self.hidden_dim, bias=True
+                        )
+                    self.audio_feature_extractor.aggregate_embed.weight = transformer_weights[
+                        "text_embedding_projection.audio_aggregate_embed.weight"
+                    ]
+                    if has_audio_bias:
+                        self.audio_feature_extractor.aggregate_embed.bias = transformer_weights[
+                            "text_embedding_projection.audio_aggregate_embed.bias"
+                        ]
+            elif "text_embedding_projection.aggregate_embed.weight" in transformer_weights:
                 self.feature_extractor.aggregate_embed.weight = transformer_weights[
                     "text_embedding_projection.aggregate_embed.weight"
                 ]
@@ -879,16 +942,20 @@ class LTX2TextEncoder(nn.Module):
         concat_hidden = norm_and_concat_hidden_states(
             all_hidden_states, attention_mask, padding_side="left"
         )
-        features = self.feature_extractor(concat_hidden)
-        additive_mask = (attention_mask - 1).astype(features.dtype)
+        video_features = self.feature_extractor(concat_hidden)
+        additive_mask = (attention_mask - 1).astype(video_features.dtype)
         additive_mask = additive_mask.reshape(attention_mask.shape[0], 1, 1, -1) * 1e9
 
-        video_embeddings, _ = self.video_embeddings_connector(features, additive_mask)
+        video_embeddings, _ = self.video_embeddings_connector(video_features, additive_mask)
 
         if return_audio_embeddings:
-            # Process features through audio connector independently (same input as video)
+            audio_features = (
+                self.audio_feature_extractor(concat_hidden)
+                if self.audio_feature_extractor is not None
+                else video_features
+            )
             audio_embeddings, _ = self.audio_embeddings_connector(
-                features, additive_mask
+                audio_features, additive_mask
             )
             return video_embeddings, audio_embeddings
         else:

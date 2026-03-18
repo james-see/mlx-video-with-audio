@@ -12,25 +12,26 @@ from mlx_video.utils import rms_norm
 
 @dataclass(frozen=True)
 class Modality:
-    latent: mx.array  
-    timesteps: mx.array  
-    positions: mx.array  
-    context: mx.array  
+    latent: mx.array
+    timesteps: mx.array
+    positions: mx.array
+    context: mx.array
     enabled: bool = True
     context_mask: Optional[mx.array] = None
 
 
 @dataclass(frozen=True)
 class TransformerArgs:
-    x: mx.array  
-    context: mx.array  
-    context_mask: Optional[mx.array] 
-    timesteps: mx.array  
-    embedded_timestep: mx.array  
-    positional_embeddings: Tuple[mx.array, mx.array] 
-    cross_positional_embeddings: Optional[Tuple[mx.array, mx.array]]  
-    cross_scale_shift_timestep: Optional[mx.array]  
-    cross_gate_timestep: Optional[mx.array]  
+    x: mx.array
+    context: mx.array
+    context_mask: Optional[mx.array]
+    timesteps: mx.array
+    embedded_timestep: mx.array
+    positional_embeddings: Tuple[mx.array, mx.array]
+    cross_positional_embeddings: Optional[Tuple[mx.array, mx.array]]
+    cross_scale_shift_timestep: Optional[mx.array]
+    cross_gate_timestep: Optional[mx.array]
+    prompt_timestep: Optional[mx.array]
     enabled: bool
 
 
@@ -70,6 +71,7 @@ class BasicAVTransformerBlock(nn.Module):
                 heads=video.heads,
                 dim_head=video.d_head,
                 context_dim=None,  # Self-attention
+                apply_gated_attention=video.apply_gated_attention,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
             )
@@ -78,12 +80,13 @@ class BasicAVTransformerBlock(nn.Module):
                 context_dim=video.context_dim,
                 heads=video.heads,
                 dim_head=video.d_head,
+                apply_gated_attention=video.apply_gated_attention,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
             )
             self.ff = FeedForward(video.dim, dim_out=video.dim)
-            # 6 scale-shift parameters: 3 for attention, 3 for MLP
             self.scale_shift_table = mx.zeros((6, video.dim))
+            self.prompt_scale_shift_table = None
 
         # Audio components
         if audio is not None:
@@ -92,6 +95,7 @@ class BasicAVTransformerBlock(nn.Module):
                 heads=audio.heads,
                 dim_head=audio.d_head,
                 context_dim=None,
+                apply_gated_attention=audio.apply_gated_attention,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
             )
@@ -100,11 +104,13 @@ class BasicAVTransformerBlock(nn.Module):
                 context_dim=audio.context_dim,
                 heads=audio.heads,
                 dim_head=audio.d_head,
+                apply_gated_attention=audio.apply_gated_attention,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
             )
             self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
             self.audio_scale_shift_table = mx.zeros((6, audio.dim))
+            self.audio_prompt_scale_shift_table = None
 
         # Cross-modal attention (when both video and audio are enabled)
         if audio is not None and video is not None:
@@ -114,6 +120,7 @@ class BasicAVTransformerBlock(nn.Module):
                 context_dim=audio.dim,
                 heads=audio.heads,
                 dim_head=audio.d_head,
+                apply_gated_attention=audio.apply_gated_attention,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
             )
@@ -123,6 +130,7 @@ class BasicAVTransformerBlock(nn.Module):
                 context_dim=video.dim,
                 heads=audio.heads,
                 dim_head=audio.d_head,
+                apply_gated_attention=audio.apply_gated_attention,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
             )
@@ -157,8 +165,7 @@ class BasicAVTransformerBlock(nn.Module):
 
         # timestep: (B, seq, num_params * dim) -> reshape to (B, seq, num_params, dim)
         timestep_reshaped = mx.reshape(
-            timestep,
-            (batch_size, timestep.shape[1], num_ada_params, -1)
+            timestep, (batch_size, timestep.shape[1], num_ada_params, -1)
         )
 
         # Extract the relevant indices
@@ -211,8 +218,12 @@ class BasicAVTransformerBlock(nn.Module):
         )
 
         # Squeeze the sequence dimension if it's 1
-        scale_shift_squeezed = tuple(mx.squeeze(t, axis=1) if t.shape[1] == 1 else t for t in scale_shift_ada)
-        gate_squeezed = tuple(mx.squeeze(t, axis=1) if t.shape[1] == 1 else t for t in gate_ada)
+        scale_shift_squeezed = tuple(
+            mx.squeeze(t, axis=1) if t.shape[1] == 1 else t for t in scale_shift_ada
+        )
+        gate_squeezed = tuple(
+            mx.squeeze(t, axis=1) if t.shape[1] == 1 else t for t in gate_ada
+        )
 
         return (*scale_shift_squeezed, *gate_squeezed)
 
@@ -241,22 +252,68 @@ class BasicAVTransformerBlock(nn.Module):
         run_a2v = run_vx and (audio is not None and audio.enabled and ax.size > 0)
         run_v2a = run_ax and (video is not None and video.enabled and vx.size > 0)
 
+        # Determine scale-shift table layout (6 or 9 params)
+        v_num_ada = (
+            self.scale_shift_table.shape[0] if hasattr(self, "scale_shift_table") else 6
+        )
+        v_has_ca_ada = v_num_ada >= 9
+        v_ff_start = 6 if v_has_ca_ada else 3
+
+        a_num_ada = (
+            self.audio_scale_shift_table.shape[0]
+            if hasattr(self, "audio_scale_shift_table")
+            else 6
+        )
+        a_has_ca_ada = a_num_ada >= 9
+        a_ff_start = 6 if a_has_ca_ada else 3
+
         # Process video self-attention and cross-attention with text
         if run_vx:
             vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
             )
 
-            # Self-attention with RoPE
             norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
             vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa
 
-            # Cross-attention with text context
-            vx = vx + self.attn2(
-                rms_norm(vx, eps=self.norm_eps),
-                context=video.context,
-                mask=video.context_mask,
-            )
+            v_context = video.context
+            if self.prompt_scale_shift_table is not None:
+                if video.prompt_timestep is not None:
+                    p_scale, p_shift = self.get_ada_values(
+                        self.prompt_scale_shift_table,
+                        vx.shape[0],
+                        video.prompt_timestep,
+                        slice(0, 2),
+                    )
+                else:
+                    p_scale, p_shift = (
+                        self.prompt_scale_shift_table[0],
+                        self.prompt_scale_shift_table[1],
+                    )
+                v_context = v_context * (1 + p_scale) + p_shift
+
+            if v_has_ca_ada:
+                vshift_ca, vscale_ca, vgate_ca = self.get_ada_values(
+                    self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
+                )
+                norm_vx_ca = (
+                    rms_norm(vx, eps=self.norm_eps) * (1 + vscale_ca) + vshift_ca
+                )
+                vx = (
+                    vx
+                    + self.attn2(
+                        norm_vx_ca,
+                        context=v_context,
+                        mask=video.context_mask,
+                    )
+                    * vgate_ca
+                )
+            else:
+                vx = vx + self.attn2(
+                    rms_norm(vx, eps=self.norm_eps),
+                    context=v_context,
+                    mask=video.context_mask,
+                )
 
         # Process audio self-attention and cross-attention with text
         if run_ax:
@@ -264,16 +321,53 @@ class BasicAVTransformerBlock(nn.Module):
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
             )
 
-            # Self-attention with RoPE
             norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
-            ax = ax + self.audio_attn1(norm_ax, pe=audio.positional_embeddings) * agate_msa
-
-            # Cross-attention with text context
-            ax = ax + self.audio_attn2(
-                rms_norm(ax, eps=self.norm_eps),
-                context=audio.context,
-                mask=audio.context_mask,
+            ax = (
+                ax
+                + self.audio_attn1(norm_ax, pe=audio.positional_embeddings) * agate_msa
             )
+
+            a_context = audio.context
+            if self.audio_prompt_scale_shift_table is not None:
+                if audio.prompt_timestep is not None:
+                    ap_scale, ap_shift = self.get_ada_values(
+                        self.audio_prompt_scale_shift_table,
+                        ax.shape[0],
+                        audio.prompt_timestep,
+                        slice(0, 2),
+                    )
+                else:
+                    ap_scale, ap_shift = (
+                        self.audio_prompt_scale_shift_table[0],
+                        self.audio_prompt_scale_shift_table[1],
+                    )
+                a_context = a_context * (1 + ap_scale) + ap_shift
+
+            if a_has_ca_ada:
+                ashift_ca, ascale_ca, agate_ca = self.get_ada_values(
+                    self.audio_scale_shift_table,
+                    ax.shape[0],
+                    audio.timesteps,
+                    slice(3, 6),
+                )
+                norm_ax_ca = (
+                    rms_norm(ax, eps=self.norm_eps) * (1 + ascale_ca) + ashift_ca
+                )
+                ax = (
+                    ax
+                    + self.audio_attn2(
+                        norm_ax_ca,
+                        context=a_context,
+                        mask=audio.context_mask,
+                    )
+                    * agate_ca
+                )
+            else:
+                ax = ax + self.audio_attn2(
+                    rms_norm(ax, eps=self.norm_eps),
+                    context=a_context,
+                    mask=audio.context_mask,
+                )
 
         # Audio-Video cross-modal attention
         if run_a2v or run_v2a:
@@ -339,7 +433,10 @@ class BasicAVTransformerBlock(nn.Module):
         # Process video feed-forward
         if run_vx:
             vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, None)
+                self.scale_shift_table,
+                vx.shape[0],
+                video.timesteps,
+                slice(v_ff_start, v_ff_start + 3),
             )
             vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
             vx = vx + self.ff(vx_scaled) * vgate_mlp
@@ -347,7 +444,10 @@ class BasicAVTransformerBlock(nn.Module):
         # Process audio feed-forward
         if run_ax:
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, None)
+                self.audio_scale_shift_table,
+                ax.shape[0],
+                audio.timesteps,
+                slice(a_ff_start, a_ff_start + 3),
             )
             ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
             ax = ax + self.audio_ff(ax_scaled) * agate_mlp

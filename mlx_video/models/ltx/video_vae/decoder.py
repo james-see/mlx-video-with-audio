@@ -692,6 +692,49 @@ def load_vae_decoder(
     ]
     print(f"  Found {len(ts_keys)} timestep conditioning weights")
 
+    def _path_exists(root, parts):
+        cur = root
+        for part in parts:
+            if isinstance(cur, dict):
+                if part in cur:
+                    cur = cur[part]
+                    continue
+                try:
+                    idx = int(part)
+                except ValueError:
+                    return False
+                if idx not in cur:
+                    return False
+                cur = cur[idx]
+                continue
+            if isinstance(cur, (list, tuple)):
+                try:
+                    idx = int(part)
+                except ValueError:
+                    return False
+                if idx < 0 or idx >= len(cur):
+                    return False
+                cur = cur[idx]
+                continue
+            if not hasattr(cur, part):
+                return False
+            cur = getattr(cur, part)
+        return True
+
+    filtered_weights = {}
+    dropped = 0
+    for key, value in decoder_weights.items():
+        if _path_exists(decoder, key.split(".")):
+            filtered_weights[key] = value
+        else:
+            dropped += 1
+    if dropped:
+        print(
+            f"  Skipped {dropped} decoder weights that do not match "
+            f"the active decoder architecture"
+        )
+    decoder_weights = filtered_weights
+
     # Load weights
     decoder.load_weights(list(decoder_weights.items()), strict=False)
 

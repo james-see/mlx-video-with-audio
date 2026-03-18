@@ -112,6 +112,22 @@ def _looks_like_text_config(config_dict: dict) -> bool:
     return required.issubset(set(config_dict.keys()))
 
 
+def _is_ltx_23_model(model_repo: Optional[str], model_path: Path) -> bool:
+    """Best-effort check for LTX-2.3 checkpoints to choose compatible upsamplers."""
+    if model_repo and "2.3" in model_repo.lower():
+        return True
+    cfg_path = model_path / "config.json"
+    if not cfg_path.exists():
+        return False
+    try:
+        with open(cfg_path, "r") as f:
+            cfg = json.load(f)
+        model_version = str(cfg.get("model_version", ""))
+        return model_version.startswith("2.3")
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
 def validate_text_encoder_config(text_encoder_path: Path) -> None:
     """Validate that the resolved text encoder path contains a usable config."""
     config_file = text_encoder_path / "config.json"
@@ -1012,13 +1028,26 @@ def generate_video_with_audio(
 
     # Upsample video latents
     print(f"{Colors.MAGENTA}🔍 Upsampling video latents 2x...{Colors.RESET}")
+    ltx_23_model = _is_ltx_23_model(model_repo, model_path)
+    local_upsampler_filename = (
+        "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+        if ltx_23_model
+        else "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+    )
+    upsampler_fallback_candidates = (
+        [("Lightricks/LTX-2.3", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")]
+        if ltx_23_model
+        else [("Lightricks/LTX-2", "ltx-2-spatial-upscaler-x2-1.0.safetensors")]
+    )
+
     upsampler = load_upsampler(
         (
-            str(hf_model_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors")
+            str(hf_model_path / local_upsampler_filename)
             if not use_unified
             else str(model_path)
         ),
         use_unified=use_unified,
+        fallback_candidates=upsampler_fallback_candidates,
     )
     mx.eval(upsampler.parameters())
 

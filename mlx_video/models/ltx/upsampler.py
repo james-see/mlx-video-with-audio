@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -330,7 +330,11 @@ def upsample_latents(
     return latent
 
 
-def load_upsampler(weights_path: str, use_unified: bool = False) -> LatentUpsampler:
+def load_upsampler(
+    weights_path: str,
+    use_unified: bool = False,
+    fallback_candidates: Optional[list[tuple[str, str]]] = None,
+) -> LatentUpsampler:
     """Load upsampler from safetensors weights.
 
     Args:
@@ -357,15 +361,34 @@ def load_upsampler(weights_path: str, use_unified: bool = False) -> LatentUpsamp
             raw_weights = mx.load(str(path / "upsampler.safetensors"))
         if raw_weights is None:
             from huggingface_hub import hf_hub_download
+            from huggingface_hub.utils import HfHubHTTPError
+
+            candidates = fallback_candidates or [
+                ("Lightricks/LTX-2", "ltx-2-spatial-upscaler-x2-1.0.safetensors")
+            ]
+            last_exc = None
 
             print(
-                "  Upsampler not in unified model, downloading from Lightricks (~1GB)..."
+                "  Upsampler not in unified model, trying Hugging Face fallback candidates..."
             )
-            upsampler_file = hf_hub_download(
-                repo_id="Lightricks/LTX-2",
-                filename="ltx-2-spatial-upscaler-x2-1.0.safetensors",
-            )
-            raw_weights = mx.load(upsampler_file)
+            for repo_id, filename in candidates:
+                try:
+                    print(f"    - trying {repo_id}/{filename}")
+                    upsampler_file = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                    )
+                    raw_weights = mx.load(upsampler_file)
+                    print(f"    - loaded fallback upsampler from {repo_id}")
+                    break
+                except (HfHubHTTPError, OSError, RuntimeError, ValueError) as e:
+                    last_exc = e
+                    print(f"    - failed {repo_id}/{filename}: {e}")
+
+            if raw_weights is None:
+                raise RuntimeError(
+                    "Failed to load spatial upsampler from all fallback candidates"
+                ) from last_exc
     else:
         print(f"Loading spatial upsampler from {weights_path}...")
         raw_weights = mx.load(weights_path)

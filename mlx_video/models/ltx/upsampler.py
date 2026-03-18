@@ -418,18 +418,20 @@ def load_upsampler(
     for key, value in raw_weights.items():
         new_key = key
 
+        # HF upsampler checkpoints use `upsampler.0.{weight,bias}` while this
+        # implementation exposes `upsampler.conv.{weight,bias}`.
+        if key.startswith("upsampler.0."):
+            new_key = key.replace("upsampler.0.", "upsampler.conv.")
+        elif key.startswith("upsampler."):
+            new_key = key
+
         # Conv3d weights: PyTorch (O, I, D, H, W) -> MLX (O, D, H, W, I)
         if "conv" in key and "weight" in key and value.ndim == 5:
             value = mx.transpose(value, (0, 2, 3, 4, 1))
 
         # Conv2d weights: PyTorch (O, I, H, W) -> MLX (O, H, W, I)
-        if "conv" in key and "weight" in key and value.ndim == 4:
+        if "conv" in new_key and "weight" in new_key and value.ndim == 4:
             value = mx.transpose(value, (0, 2, 3, 1))
-
-        # Map upsampler.conv to upsampler.conv (SpatialRationalResampler)
-        # Keys: upsampler.conv.weight, upsampler.conv.bias, upsampler.blur_down.kernel
-        if key.startswith("upsampler."):
-            new_key = key  # Keep as is for SpatialRationalResampler
 
         sanitized[new_key] = value
 

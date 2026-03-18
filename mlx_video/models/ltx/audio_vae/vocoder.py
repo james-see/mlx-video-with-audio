@@ -184,6 +184,7 @@ class BigVGANVocoder(nn.Module):
         output_sample_rate: int = 24000,
         use_tanh_at_final: bool = False,
         use_bias_at_final: bool = False,
+        apply_final_activation: bool = True,
     ):
         super().__init__()
 
@@ -200,6 +201,7 @@ class BigVGANVocoder(nn.Module):
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
         self.use_tanh_at_final = use_tanh_at_final
+        self.apply_final_activation = apply_final_activation
 
         in_channels = 128 if stereo else 64
         self.conv_pre = nn.Conv1d(
@@ -268,7 +270,106 @@ class BigVGANVocoder(nn.Module):
 
         x = self.act_post(x)
         x = self.conv_post(x)
-        if self.use_tanh_at_final:
-            x = mx.tanh(x)
+        if self.apply_final_activation:
+            if self.use_tanh_at_final:
+                x = mx.tanh(x)
+            else:
+                x = mx.clip(x, -1.0, 1.0)
         x = mx.transpose(x, (0, 2, 1))
         return x
+
+
+class VocoderWithBWE(nn.Module):
+    """Checkpoint-compatible vocoder + BWE wrapper.
+
+    Notes:
+    - Mirrors upstream module structure so `bwe_generator.*` and `mel_stft.*`
+      tensors from checkpoints are loaded and used at runtime.
+    - Uses an STFT-basis projection (from checkpoint tensors) to compute mel
+      features for the BWE generator.
+    """
+
+    def __init__(
+        self,
+        vocoder: BigVGANVocoder,
+        bwe_generator: BigVGANVocoder,
+        input_sampling_rate: int = 16000,
+        output_sampling_rate: int = 48000,
+        hop_length: int = 80,
+        win_length: int = 512,
+    ):
+        super().__init__()
+        self.vocoder = vocoder
+        self.bwe_generator = bwe_generator
+        self.mel_stft = _MelSTFT()
+        self.input_sampling_rate = input_sampling_rate
+        self.output_sampling_rate = output_sampling_rate
+        self.hop_length = hop_length
+        self.win_length = win_length
+
+    def _compute_mel(self, audio: mx.array) -> mx.array:
+        """Compute log-mel from waveform using checkpoint STFT/mel bases.
+
+        Args:
+            audio: (B, C, T)
+        Returns:
+            (B, C, n_mels, T_frames)
+        """
+        b, c, t = audio.shape
+        x = mx.reshape(audio, (b * c, t))
+
+        # Upstream uses causal left-only pad: win_length - hop_length.
+        left_pad = max(0, self.win_length - self.hop_length)
+        x = mx.pad(x, [(0, 0), (left_pad, 0)])
+
+        total = x.shape[1]
+        if total < self.win_length:
+            x = mx.pad(x, [(0, 0), (0, self.win_length - total)])
+            total = x.shape[1]
+        n_frames = max(1, (total - self.win_length) // self.hop_length + 1)
+
+        basis = self.mel_stft.stft_fn.forward_basis[:, 0, :]  # (2*n_freq, win)
+        n_freq = basis.shape[0] // 2
+        mel_basis = self.mel_stft.mel_basis  # (n_mels, n_freq)
+
+        frames = []
+        for i in range(n_frames):
+            start = i * self.hop_length
+            end = start + self.win_length
+            seg = x[:, start:end]  # (B*C, win)
+            if seg.shape[1] < self.win_length:
+                seg = mx.pad(seg, [(0, 0), (0, self.win_length - seg.shape[1])])
+            # (2*n_freq, B*C)
+            spec = mx.matmul(basis, mx.transpose(seg, (1, 0)))
+            spec = mx.transpose(spec, (1, 0))  # (B*C, 2*n_freq)
+            real = spec[:, :n_freq]
+            imag = spec[:, n_freq:]
+            magnitude = mx.sqrt(real * real + imag * imag)
+            mel = mx.matmul(magnitude, mx.transpose(mel_basis, (1, 0)))
+            mel = mx.log(mx.maximum(mel, 1e-5))
+            frames.append(mel)
+
+        mel_bt = mx.stack(frames, axis=1)  # (B*C, T_frames, n_mels)
+        mel = mx.reshape(mel_bt, (b, c, n_frames, mel_bt.shape[-1]))
+        mel = mx.transpose(mel, (0, 1, 3, 2))  # (B, C, n_mels, T_frames)
+        return mel
+
+    def _upsample_skip(self, x: mx.array) -> mx.array:
+        """Simple skip upsample to BWE sample rate.
+
+        Upstream uses a Hann-windowed sinc resampler. This uses nearest repeat
+        for now to preserve runtime portability in pure MLX.
+        """
+        ratio = max(1, self.output_sampling_rate // self.input_sampling_rate)
+        return mx.repeat(x, ratio, axis=2)
+
+    def __call__(self, mel_spec: mx.array) -> mx.array:
+        low = self.vocoder(mel_spec)  # (B, C, T_low)
+        mel_from_low = self._compute_mel(low)  # (B, C, n_mels, T_frames)
+        mel_for_bwe = mx.transpose(mel_from_low, (0, 1, 3, 2))  # (B, C, T, n_mels)
+        residual = self.bwe_generator(mel_for_bwe)  # (B, C, T_high)
+        skip = self._upsample_skip(low)  # (B, C, T_high_approx)
+
+        target = min(residual.shape[2], skip.shape[2])
+        out = residual[:, :, :target] + skip[:, :, :target]
+        return mx.clip(out, -1.0, 1.0)

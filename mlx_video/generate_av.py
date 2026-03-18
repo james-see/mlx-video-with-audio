@@ -483,7 +483,7 @@ def load_vocoder(model_path: Path, use_unified: bool = False):
         model_path: Path to model directory
         use_unified: If True, load from unified MLX format
     """
-    from mlx_video.models.ltx.audio_vae import BigVGANVocoder, Vocoder
+    from mlx_video.models.ltx.audio_vae import BigVGANVocoder, Vocoder, VocoderWithBWE
 
     resblock_kernel_sizes = [3, 7, 11]
     upsample_rates = [6, 5, 2, 2, 2]
@@ -494,11 +494,14 @@ def load_vocoder(model_path: Path, use_unified: bool = False):
     vocoder_activation = "leaky_relu"
     use_tanh_at_final = True
     use_bias_at_final = True
+    apply_final_activation = True
+    bwe_cfg = None
     embedded_cfg_path = model_path / "embedded_config.json"
     if embedded_cfg_path.exists():
         try:
             with open(embedded_cfg_path, "r") as f:
-                voc_cfg = json.load(f).get("vocoder", {}).get("vocoder", {})
+                embedded_cfg = json.load(f)
+            voc_cfg = embedded_cfg.get("vocoder", {}).get("vocoder", {})
             if voc_cfg:
                 upsample_initial_channel = voc_cfg.get(
                     "upsample_initial_channel", upsample_initial_channel
@@ -523,11 +526,16 @@ def load_vocoder(model_path: Path, use_unified: bool = False):
                 use_bias_at_final = bool(
                     voc_cfg.get("use_bias_at_final", use_bias_at_final)
                 )
+                apply_final_activation = bool(
+                    voc_cfg.get("apply_final_activation", apply_final_activation)
+                )
+            bwe_cfg = embedded_cfg.get("vocoder", {}).get("bwe", None)
         except (json.JSONDecodeError, OSError):
             pass
 
-    if vocoder_activation == "snakebeta" or vocoder_resblock.upper() == "AMP1":
-        vocoder = BigVGANVocoder(
+    is_bigvgan = vocoder_activation == "snakebeta" or vocoder_resblock.upper() == "AMP1"
+    if is_bigvgan:
+        core_vocoder = BigVGANVocoder(
             resblock_kernel_sizes=resblock_kernel_sizes,
             upsample_rates=upsample_rates,
             upsample_kernel_sizes=upsample_kernel_sizes,
@@ -537,7 +545,47 @@ def load_vocoder(model_path: Path, use_unified: bool = False):
             output_sample_rate=AUDIO_SAMPLE_RATE,
             use_tanh_at_final=use_tanh_at_final,
             use_bias_at_final=use_bias_at_final,
+            apply_final_activation=apply_final_activation,
         )
+        if bwe_cfg:
+            bwe_vocoder = BigVGANVocoder(
+                resblock_kernel_sizes=bwe_cfg.get(
+                    "resblock_kernel_sizes", resblock_kernel_sizes
+                ),
+                upsample_rates=bwe_cfg.get("upsample_rates", upsample_rates),
+                upsample_kernel_sizes=bwe_cfg.get(
+                    "upsample_kernel_sizes", upsample_kernel_sizes
+                ),
+                resblock_dilation_sizes=bwe_cfg.get(
+                    "resblock_dilation_sizes", resblock_dilation_sizes
+                ),
+                upsample_initial_channel=bwe_cfg.get(
+                    "upsample_initial_channel", upsample_initial_channel
+                ),
+                stereo=bool(bwe_cfg.get("stereo", True)),
+                output_sample_rate=int(
+                    bwe_cfg.get("output_sampling_rate", AUDIO_SAMPLE_RATE)
+                ),
+                use_tanh_at_final=bool(bwe_cfg.get("use_tanh_at_final", False)),
+                use_bias_at_final=bool(bwe_cfg.get("use_bias_at_final", False)),
+                apply_final_activation=bool(
+                    bwe_cfg.get("apply_final_activation", False)
+                ),
+            )
+            vocoder = VocoderWithBWE(
+                vocoder=core_vocoder,
+                bwe_generator=bwe_vocoder,
+                input_sampling_rate=int(
+                    bwe_cfg.get("input_sampling_rate", AUDIO_SAMPLE_RATE)
+                ),
+                output_sampling_rate=int(
+                    bwe_cfg.get("output_sampling_rate", AUDIO_SAMPLE_RATE)
+                ),
+                hop_length=int(bwe_cfg.get("hop_length", 80)),
+                win_length=int(bwe_cfg.get("win_size", 512)),
+            )
+        else:
+            vocoder = core_vocoder
     else:
         vocoder = Vocoder(
             resblock_kernel_sizes=resblock_kernel_sizes,
@@ -563,6 +611,14 @@ def load_vocoder(model_path: Path, use_unified: bool = False):
                     value = mx.transpose(value, (1, 2, 0))
                 fixed[key] = value
             sanitized = fixed
+            if isinstance(vocoder, VocoderWithBWE):
+                mapped = {}
+                for key, value in sanitized.items():
+                    if key.startswith("bwe_generator.") or key.startswith("mel_stft."):
+                        mapped[key] = value
+                    else:
+                        mapped[f"vocoder.{key}"] = value
+                sanitized = mapped
             vocoder.load_weights(list(sanitized.items()), strict=False)
     else:
         # Load from HuggingFace format (needs sanitization)
@@ -1197,6 +1253,13 @@ def generate_video_with_audio(
     print(f"{Colors.BLUE}🔊 Decoding audio...{Colors.RESET}")
     audio_decoder = load_audio_decoder(model_path, use_unified=use_unified)
     vocoder = load_vocoder(model_path, use_unified=use_unified)
+    audio_sample_rate = int(
+        getattr(
+            vocoder,
+            "output_sampling_rate",
+            getattr(vocoder, "output_sample_rate", AUDIO_SAMPLE_RATE),
+        )
+    )
     mx.eval(audio_decoder.parameters(), vocoder.parameters())
 
     mel_spectrogram = audio_decoder(audio_latents)
@@ -1245,7 +1308,7 @@ def generate_video_with_audio(
         os.close(fd)
         audio_path = Path(tmp)
 
-    save_audio(audio_np, audio_path, AUDIO_SAMPLE_RATE)
+    save_audio(audio_np, audio_path, audio_sample_rate)
     if keep_audio_file:
         print(f"{Colors.GREEN}✅ Saved audio to{Colors.RESET} {audio_path}")
 

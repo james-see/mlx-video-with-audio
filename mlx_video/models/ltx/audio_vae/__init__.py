@@ -7,9 +7,16 @@ from .causality_axis import CausalityAxis
 from .downsample import Downsample, build_downsampling_path
 from .normalization import NormType, PixelNorm, build_normalization_layer
 from .ops import AudioLatentShape, AudioPatchifier, PerChannelStatistics
-from .resnet import AMPBlock1, LRELU_SLOPE, ResBlock1, ResBlock2, ResnetBlock, SnakeBeta
+from .resnet import (
+    AMPBlock1,
+    LRELU_SLOPE,
+    ResBlock1,
+    ResBlock2,
+    ResnetBlock,
+    SnakeBeta,
+)
 from .upsample import Upsample, build_upsampling_path
-from .vocoder import BigVGANVocoder, Vocoder
+from .vocoder import BigVGANVocoder, Vocoder, VocoderWithBWE
 
 __all__ = [
     # Main components
@@ -40,5 +47,6 @@ __all__ = [
     "LRELU_SLOPE",
     "Upsample",
     "BigVGANVocoder",
+    "VocoderWithBWE",
     "build_upsampling_path",
 ]

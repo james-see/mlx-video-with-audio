@@ -748,6 +748,13 @@ def load_vae_decoder(
         decoder.latents_std = weights[std_key]
         print(f"  Loaded latent std: shape {decoder.latents_std.shape}")
 
+    # True unified checkpoints already store Conv3d kernels in MLX layout.
+    # PyTorch checkpoints need transpose to MLX layout.
+    source_is_unified = bool(
+        use_unified
+        and weights_path.name in {"model.safetensors", "vae_decoder.safetensors"}
+    )
+
     # Build decoder weights dict with key remapping
     decoder_weights = {}
     for key, value in weights.items():
@@ -760,20 +767,17 @@ def load_vae_decoder(
         # Remove prefix
         new_key = key[len(prefix) :]
 
-        # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
-        # Skip when loading from unified model - convert script already saved MLX format
-        if ".conv.weight" in key and value.ndim == 5 and not unified_prefix:
-            value = mx.transpose(value, (0, 2, 3, 4, 1))
-        # Some unified checkpoints contain malformed conv3d layout:
-        # (O, D, H, I, W) instead of (O, D, H, W, I). Fix by swapping trailing dims.
-        if (
-            ".conv.weight" in key
-            and value.ndim == 5
-            and value.shape[-1] <= 5
-            and value.shape[-2] > value.shape[-1]
-        ):
-            value = mx.transpose(value, (0, 1, 2, 4, 3))
-            print(f"  Fixed malformed Conv3d layout for {key}: now {value.shape}")
+        # Handle Conv3d weight layout:
+        # - PyTorch source: (O, I, D, H, W) -> transpose to MLX (O, D, H, W, I)
+        # - Unified MLX source: keep as-is, except rare malformed variant.
+        if ".conv.weight" in key and value.ndim == 5:
+            if not source_is_unified:
+                value = mx.transpose(value, (0, 2, 3, 4, 1))
+            # Rare malformed unified layout:
+            # (O, D, H, I, W) instead of (O, D, H, W, I).
+            elif value.shape[-1] <= 5 and value.shape[-2] > value.shape[-1]:
+                value = mx.transpose(value, (0, 1, 2, 4, 3))
+                print(f"  Fixed malformed Conv3d layout for {key}: now {value.shape}")
         if ".conv.bias" in key:
             pass  # bias doesn't need transpose
 

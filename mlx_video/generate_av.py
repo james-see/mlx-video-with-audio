@@ -99,21 +99,6 @@ def is_unified_mlx_model(model_path: Path) -> bool:
     return False
 
 
-def unified_vae_layout_supported(model_path: Path) -> bool:
-    """Return whether unified repo VAE layout matches current decoder implementation."""
-    embedded_cfg_path = model_path / "embedded_config.json"
-    if not embedded_cfg_path.exists():
-        return True
-    try:
-        with open(embedded_cfg_path, "r") as f:
-            vae_cfg = json.load(f).get("vae", {})
-        decoder_blocks = vae_cfg.get("decoder_blocks")
-        # Current MLX decoder implementation supports the classic 7-stage decoder.
-        return not isinstance(decoder_blocks, list) or len(decoder_blocks) == 7
-    except (json.JSONDecodeError, OSError):
-        return True
-
-
 def _looks_like_text_config(config_dict: dict) -> bool:
     required = {
         "hidden_size",
@@ -716,12 +701,6 @@ def generate_video_with_audio(
             text_encoder_repo or DEFAULT_UNIFIED_TEXT_ENCODER
         )
         vae_model_path = model_path
-        if not unified_vae_layout_supported(model_path):
-            print(
-                f"{Colors.DIM}Unified VAE layout not yet supported; "
-                f"falling back to {DEFAULT_HF_MODEL} VAE{Colors.RESET}"
-            )
-            vae_model_path = get_model_path(DEFAULT_HF_MODEL)
     else:
         text_encoder_path = (
             model_path

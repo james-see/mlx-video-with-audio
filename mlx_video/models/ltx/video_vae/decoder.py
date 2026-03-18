@@ -255,6 +255,7 @@ class LTX2VideoDecoder(nn.Module):
         out_channels: int = 3,
         patch_size: int = 4,
         num_layers_per_block: int = 5,
+        decoder_blocks: Optional[list] = None,
         spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
         timestep_conditioning: bool = True,
     ):
@@ -290,46 +291,66 @@ class LTX2VideoDecoder(nn.Module):
 
         self.conv_in = ConvInWrapper()
 
-        # Up blocks: alternating ResBlockGroup and DepthToSpaceUpsample
-        # Use dict with int keys for MLX to track parameters properly
-        self.up_blocks = {
-            0: ResBlockGroup(
-                1024, num_layers_per_block, spatial_padding_mode, timestep_conditioning
-            ),
-            1: DepthToSpaceUpsample(
-                dims=3,
-                in_channels=1024,
-                stride=(2, 2, 2),
-                residual=True,
-                out_channels_reduction_factor=2,
+        # Up blocks: alternating ResBlockGroup and DepthToSpaceUpsample.
+        # If decoder_blocks are provided from embedded config, build dynamically.
+        self.up_blocks = {}
+        if decoder_blocks:
+            self._build_up_blocks_from_config(
+                decoder_blocks,
                 spatial_padding_mode=spatial_padding_mode,
-            ),
-            2: ResBlockGroup(
-                512, num_layers_per_block, spatial_padding_mode, timestep_conditioning
-            ),
-            3: DepthToSpaceUpsample(
-                dims=3,
-                in_channels=512,
-                stride=(2, 2, 2),
-                residual=True,
-                out_channels_reduction_factor=2,
-                spatial_padding_mode=spatial_padding_mode,
-            ),
-            4: ResBlockGroup(
-                256, num_layers_per_block, spatial_padding_mode, timestep_conditioning
-            ),
-            5: DepthToSpaceUpsample(
-                dims=3,
-                in_channels=256,
-                stride=(2, 2, 2),
-                residual=True,
-                out_channels_reduction_factor=2,
-                spatial_padding_mode=spatial_padding_mode,
-            ),
-            6: ResBlockGroup(
-                128, num_layers_per_block, spatial_padding_mode, timestep_conditioning
-            ),
-        }
+                timestep_conditioning=timestep_conditioning,
+            )
+        else:
+            self.up_blocks = {
+                0: ResBlockGroup(
+                    1024,
+                    num_layers_per_block,
+                    spatial_padding_mode,
+                    timestep_conditioning,
+                ),
+                1: DepthToSpaceUpsample(
+                    dims=3,
+                    in_channels=1024,
+                    stride=(2, 2, 2),
+                    residual=True,
+                    out_channels_reduction_factor=2,
+                    spatial_padding_mode=spatial_padding_mode,
+                ),
+                2: ResBlockGroup(
+                    512,
+                    num_layers_per_block,
+                    spatial_padding_mode,
+                    timestep_conditioning,
+                ),
+                3: DepthToSpaceUpsample(
+                    dims=3,
+                    in_channels=512,
+                    stride=(2, 2, 2),
+                    residual=True,
+                    out_channels_reduction_factor=2,
+                    spatial_padding_mode=spatial_padding_mode,
+                ),
+                4: ResBlockGroup(
+                    256,
+                    num_layers_per_block,
+                    spatial_padding_mode,
+                    timestep_conditioning,
+                ),
+                5: DepthToSpaceUpsample(
+                    dims=3,
+                    in_channels=256,
+                    stride=(2, 2, 2),
+                    residual=True,
+                    out_channels_reduction_factor=2,
+                    spatial_padding_mode=spatial_padding_mode,
+                ),
+                6: ResBlockGroup(
+                    128,
+                    num_layers_per_block,
+                    spatial_padding_mode,
+                    timestep_conditioning,
+                ),
+            }
 
         final_out_channels = out_channels * patch_size * patch_size
 
@@ -358,6 +379,63 @@ class LTX2VideoDecoder(nn.Module):
                 embedding_dim=128 * 2  # 256, matches (2, 128) table
             )
             self.last_scale_shift_table = mx.zeros((2, 128))
+
+    def _build_up_blocks_from_config(
+        self,
+        decoder_blocks: list,
+        spatial_padding_mode: PaddingModeType,
+        timestep_conditioning: bool,
+    ) -> None:
+        """Build decoder up_blocks from embedded_config `vae.decoder_blocks`.
+
+        The config is listed in encoder order; decoder execution path is reversed.
+        """
+
+        def _stride_for_block(kind: str) -> tuple[int, int, int]:
+            if kind == "compress_space":
+                return (1, 2, 2)
+            if kind == "compress_time":
+                return (2, 1, 1)
+            if kind == "compress_all":
+                return (2, 2, 2)
+            # Fallback to spatial+temporal upsample.
+            return (2, 2, 2)
+
+        block_idx = 0
+        current_channels = 1024
+
+        # Reverse to decoder execution order.
+        for block in reversed(decoder_blocks):
+            if not isinstance(block, (list, tuple)) or len(block) != 2:
+                continue
+            kind, params = block
+            params = params or {}
+
+            if kind == "res_x":
+                num_layers = int(params.get("num_layers", 5))
+                self.up_blocks[block_idx] = ResBlockGroup(
+                    current_channels,
+                    num_layers,
+                    spatial_padding_mode,
+                    timestep_conditioning,
+                )
+                block_idx += 1
+                continue
+
+            if kind.startswith("compress_"):
+                reduction = int(params.get("multiplier", 2))
+                reduction = max(reduction, 1)
+                stride = _stride_for_block(kind)
+                self.up_blocks[block_idx] = DepthToSpaceUpsample(
+                    dims=3,
+                    in_channels=current_channels,
+                    stride=stride,
+                    residual=True,
+                    out_channels_reduction_factor=reduction,
+                    spatial_padding_mode=spatial_padding_mode,
+                )
+                current_channels = current_channels // reduction
+                block_idx += 1
 
     def denormalize(self, x: mx.array) -> mx.array:
         """Denormalize latents using per-channel statistics."""
@@ -586,6 +664,25 @@ def load_vae_decoder(
     print(f"Loading VAE decoder from {weights_path}...")
 
     # Read config from safetensors metadata to auto-detect timestep_conditioning
+    decoder_blocks = None
+    spatial_padding_mode = PaddingModeType.REFLECT
+    embedded_cfg_path = model_path / "embedded_config.json"
+    if embedded_cfg_path.exists():
+        try:
+            with open(embedded_cfg_path, "r") as f:
+                vae_cfg = json.load(f).get("vae", {})
+            decoder_blocks = vae_cfg.get("decoder_blocks")
+            padding_name = str(vae_cfg.get("spatial_padding_mode", "reflect")).lower()
+            if padding_name == "zeros":
+                spatial_padding_mode = PaddingModeType.ZEROS
+            elif padding_name == "replicate":
+                spatial_padding_mode = PaddingModeType.REPLICATE
+            elif padding_name == "reflect":
+                spatial_padding_mode = PaddingModeType.REFLECT
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Read config from safetensors metadata to auto-detect timestep_conditioning
     if timestep_conditioning is None:
         try:
             with safe_open(str(weights_path), framework="numpy") as f:
@@ -607,7 +704,11 @@ def load_vae_decoder(
             )
             timestep_conditioning = False
 
-    decoder = LTX2VideoDecoder(timestep_conditioning=timestep_conditioning)
+    decoder = LTX2VideoDecoder(
+        timestep_conditioning=timestep_conditioning,
+        decoder_blocks=decoder_blocks,
+        spatial_padding_mode=spatial_padding_mode,
+    )
 
     weights = mx.load(str(weights_path))
 

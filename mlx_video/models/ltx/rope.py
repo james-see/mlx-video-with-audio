@@ -1,4 +1,3 @@
-
 import math
 from typing import Callable, List, Optional, Tuple
 
@@ -87,10 +86,11 @@ def rotate_half_interleaved(x: mx.array) -> mx.array:
     """
     # x: (..., dim) where dim is even
     x_even = x[..., 0::2]  # [x0, x2, x4, ...]
-    x_odd = x[..., 1::2]   # [x1, x3, x5, ...]
+    x_odd = x[..., 1::2]  # [x1, x3, x5, ...]
     # Stack: [[-x1, x0], [-x3, x2], ...] then flatten to [-x1, x0, -x3, x2, ...]
     rotated = mx.stack([-x_odd, x_even], axis=-1)
     return mx.reshape(rotated, x.shape)
+
 
 def apply_rotary_emb_1d(
     q: mx.array,
@@ -229,9 +229,9 @@ def get_fractional_positions(
         Fractional positions in range [-1, 1] after scaling
     """
     n_pos_dims = indices_grid.shape[1]
-    assert n_pos_dims == len(max_pos), (
-        f"Number of position dimensions ({n_pos_dims}) must match max_pos length ({len(max_pos)})"
-    )
+    assert n_pos_dims == len(
+        max_pos
+    ), f"Number of position dimensions ({n_pos_dims}) must match max_pos length ({len(max_pos)})"
 
     # Divide each dimension by its max position
     fractional_positions = []
@@ -393,11 +393,15 @@ def precompute_freqs_cis(
     if max_pos is None:
         max_pos = [20, 2048, 2048]
 
-
     if double_precision:
         return _precompute_freqs_cis_double_precision(
-            indices_grid, dim, theta, max_pos, use_middle_indices_grid,
-            num_attention_heads, rope_type
+            indices_grid,
+            dim,
+            theta,
+            max_pos,
+            use_middle_indices_grid,
+            num_attention_heads,
+            rope_type,
         )
 
     # Generate frequency indices
@@ -433,12 +437,13 @@ def _precompute_freqs_cis_double_precision(
     # Warn if positions are bfloat16 - this causes quality degradation
     if indices_grid.dtype == mx.bfloat16:
         import warnings
+
         warnings.warn(
             "Position grid has dtype bfloat16, which causes precision loss in RoPE that causes quality degradation in generated videos/audio. "
             "Use float32 for position grids to avoid quality degradation. "
             "See tests/test_rope.py::test_bfloat16_positions_cause_precision_loss",
             UserWarning,
-            stacklevel=2
+            stacklevel=2,
         )
 
     # Convert to numpy float64 (first to float32 for numpy compatibility)

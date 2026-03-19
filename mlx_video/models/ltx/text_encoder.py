@@ -255,6 +255,7 @@ class ConnectorAttention(nn.Module):
         dim: int = 3840,
         num_heads: int = 30,
         head_dim: int = 128,
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -271,6 +272,9 @@ class ConnectorAttention(nn.Module):
         # Standard RMSNorm (not Gemma-style) on full inner_dim
         self.q_norm = nn.RMSNorm(inner_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(inner_dim, eps=1e-6)
+        self.to_gate_logits = (
+            nn.Linear(dim, num_heads, bias=True) if apply_gated_attention else None
+        )
 
     def __call__(
         self,
@@ -309,6 +313,12 @@ class ConnectorAttention(nn.Module):
         # No mask needed for connector - after register replacement, all positions are valid
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
         out = out.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        if self.to_gate_logits is not None:
+            gates = nn.sigmoid(self.to_gate_logits(x))
+            gates = mx.expand_dims(gates, axis=-1)
+            out = mx.reshape(out, (batch_size, seq_len, self.num_heads, self.head_dim))
+            out = out * gates
+            out = mx.reshape(out, (batch_size, seq_len, -1))
 
         return self.to_out(out)
 
@@ -379,9 +389,17 @@ class ConnectorFeedForward(nn.Module):
 
 class ConnectorTransformerBlock(nn.Module):
 
-    def __init__(self, dim: int = 3840, num_heads: int = 30, head_dim: int = 128):
+    def __init__(
+        self,
+        dim: int = 3840,
+        num_heads: int = 30,
+        head_dim: int = 128,
+        apply_gated_attention: bool = False,
+    ):
         super().__init__()
-        self.attn1 = ConnectorAttention(dim, num_heads, head_dim)
+        self.attn1 = ConnectorAttention(
+            dim, num_heads, head_dim, apply_gated_attention=apply_gated_attention
+        )
         self.ff = ConnectorFeedForward(dim)
 
     def __call__(
@@ -420,6 +438,7 @@ class Embeddings1DConnector(nn.Module):
         num_learnable_registers: int = 128,
         positional_embedding_theta: float = 10000.0,
         positional_embedding_max_pos: list = None,
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -431,7 +450,12 @@ class Embeddings1DConnector(nn.Module):
 
         # Use dict with int keys for MLX to track parameters (lists are not tracked)
         self.transformer_1d_blocks = {
-            i: ConnectorTransformerBlock(dim, num_heads, head_dim)
+            i: ConnectorTransformerBlock(
+                dim,
+                num_heads,
+                head_dim,
+                apply_gated_attention=apply_gated_attention,
+            )
             for i in range(num_layers)
         }
 
@@ -644,6 +668,25 @@ def norm_and_concat_hidden_states(
     return normed
 
 
+def norm_and_concat_per_token_rms(
+    hidden_states: List[mx.array],
+    attention_mask: mx.array,
+) -> mx.array:
+    """Per-token RMS normalization used by newer LTX 2.3 Gemma feature extractors."""
+    encoded = mx.stack(hidden_states, axis=-1)
+    variance = mx.mean(encoded**2, axis=2, keepdims=True)
+    normed = encoded * mx.rsqrt(variance + 1e-6)
+    b, t, d, l = encoded.shape
+    normed = mx.reshape(normed, (b, t, d * l))
+    mask = attention_mask.astype(mx.bool_)[:, :, None]
+    return mx.where(mask, normed, mx.zeros_like(normed))
+
+
+def rescale_norm(x: mx.array, target_dim: int, source_dim: int) -> mx.array:
+    """Match the scaling used by the official FeatureExtractorV2 path."""
+    return x * math.sqrt(target_dim / source_dim)
+
+
 class GemmaFeaturesExtractor(nn.Module):
 
     def __init__(self, input_dim: int = 188160, output_dim: int = 3840):
@@ -677,6 +720,7 @@ class LTX2TextEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.audio_dim = audio_dim
         self.num_layers = num_layers
+        self.feature_extractor_variant = "v1"
         self.language_model = None
 
         # Feature extractor: 3840*49 -> 3840
@@ -734,7 +778,7 @@ class LTX2TextEncoder(nn.Module):
             transformer_weights = {}
             for k, v in connector_raw.items():
                 if k.startswith("connector."):
-                    sub = k[len("connector."):]
+                    sub = k[len("connector.") :]
                     if sub.startswith("text_embedding_projection."):
                         transformer_weights[sub] = v
                     else:
@@ -757,12 +801,25 @@ class LTX2TextEncoder(nn.Module):
                         embedded_cfg = json.load(f).get("transformer", {})
                     conn_layers = embedded_cfg.get("connector_num_layers", 2)
                     conn_heads = embedded_cfg.get("connector_num_attention_heads", 30)
-                    conn_head_dim = embedded_cfg.get("connector_attention_head_dim", 128)
-                    conn_registers = embedded_cfg.get("connector_num_learnable_registers", 128)
-                    conn_max_pos = embedded_cfg.get("connector_positional_embedding_max_pos", [4096])
-                    audio_conn_heads = embedded_cfg.get("audio_connector_num_attention_heads", conn_heads)
-                    audio_conn_head_dim = embedded_cfg.get("audio_connector_attention_head_dim", conn_head_dim)
-                    if conn_layers != 2 or conn_heads != 30:
+                    conn_head_dim = embedded_cfg.get(
+                        "connector_attention_head_dim", 128
+                    )
+                    conn_registers = embedded_cfg.get(
+                        "connector_num_learnable_registers", 128
+                    )
+                    conn_max_pos = embedded_cfg.get(
+                        "connector_positional_embedding_max_pos", [4096]
+                    )
+                    conn_gated = bool(
+                        embedded_cfg.get("connector_apply_gated_attention", False)
+                    )
+                    audio_conn_heads = embedded_cfg.get(
+                        "audio_connector_num_attention_heads", conn_heads
+                    )
+                    audio_conn_head_dim = embedded_cfg.get(
+                        "audio_connector_attention_head_dim", conn_head_dim
+                    )
+                    if conn_layers != 2 or conn_heads != 30 or conn_gated:
                         self.video_embeddings_connector = Embeddings1DConnector(
                             dim=self.hidden_dim,
                             num_heads=conn_heads,
@@ -770,6 +827,7 @@ class LTX2TextEncoder(nn.Module):
                             num_layers=conn_layers,
                             num_learnable_registers=conn_registers,
                             positional_embedding_max_pos=conn_max_pos,
+                            apply_gated_attention=conn_gated,
                         )
                         self.audio_embeddings_connector = Embeddings1DConnector(
                             dim=self.hidden_dim,
@@ -778,16 +836,26 @@ class LTX2TextEncoder(nn.Module):
                             num_layers=conn_layers,
                             num_learnable_registers=conn_registers,
                             positional_embedding_max_pos=conn_max_pos,
+                            apply_gated_attention=conn_gated,
                         )
                 except (json.JSONDecodeError, OSError):
                     pass
 
             # Load feature extractor(s)
-            if "text_embedding_projection.video_aggregate_embed.weight" in transformer_weights:
+            if (
+                "text_embedding_projection.video_aggregate_embed.weight"
+                in transformer_weights
+            ):
+                video_out_dim = transformer_weights[
+                    "text_embedding_projection.video_aggregate_embed.weight"
+                ].shape[0]
                 self.feature_extractor.aggregate_embed.weight = transformer_weights[
                     "text_embedding_projection.video_aggregate_embed.weight"
                 ]
-                if "text_embedding_projection.video_aggregate_embed.bias" in transformer_weights:
+                if (
+                    "text_embedding_projection.video_aggregate_embed.bias"
+                    in transformer_weights
+                ):
                     self.feature_extractor.aggregate_embed = nn.Linear(
                         self.feature_extractor.aggregate_embed.weight.shape[1],
                         self.feature_extractor.aggregate_embed.weight.shape[0],
@@ -799,24 +867,47 @@ class LTX2TextEncoder(nn.Module):
                     self.feature_extractor.aggregate_embed.bias = transformer_weights[
                         "text_embedding_projection.video_aggregate_embed.bias"
                     ]
-                if "text_embedding_projection.audio_aggregate_embed.weight" in transformer_weights:
+                if (
+                    "text_embedding_projection.audio_aggregate_embed.weight"
+                    in transformer_weights
+                ):
+                    audio_out_dim = transformer_weights[
+                        "text_embedding_projection.audio_aggregate_embed.weight"
+                    ].shape[0]
                     self.audio_feature_extractor = GemmaFeaturesExtractor(
                         input_dim=self.hidden_dim * self.num_layers,
                         output_dim=self.hidden_dim,
                     )
-                    has_audio_bias = "text_embedding_projection.audio_aggregate_embed.bias" in transformer_weights
+                    has_audio_bias = (
+                        "text_embedding_projection.audio_aggregate_embed.bias"
+                        in transformer_weights
+                    )
                     if has_audio_bias:
                         self.audio_feature_extractor.aggregate_embed = nn.Linear(
-                            self.hidden_dim * self.num_layers, self.hidden_dim, bias=True
+                            self.hidden_dim * self.num_layers,
+                            self.hidden_dim,
+                            bias=True,
                         )
-                    self.audio_feature_extractor.aggregate_embed.weight = transformer_weights[
-                        "text_embedding_projection.audio_aggregate_embed.weight"
-                    ]
-                    if has_audio_bias:
-                        self.audio_feature_extractor.aggregate_embed.bias = transformer_weights[
-                            "text_embedding_projection.audio_aggregate_embed.bias"
+                    self.audio_feature_extractor.aggregate_embed.weight = (
+                        transformer_weights[
+                            "text_embedding_projection.audio_aggregate_embed.weight"
                         ]
-            elif "text_embedding_projection.aggregate_embed.weight" in transformer_weights:
+                    )
+                    if has_audio_bias:
+                        self.audio_feature_extractor.aggregate_embed.bias = (
+                            transformer_weights[
+                                "text_embedding_projection.audio_aggregate_embed.bias"
+                            ]
+                        )
+                    if (
+                        video_out_dim != self.hidden_dim
+                        or audio_out_dim != self.hidden_dim
+                    ):
+                        self.feature_extractor_variant = "v2"
+            elif (
+                "text_embedding_projection.aggregate_embed.weight"
+                in transformer_weights
+            ):
                 self.feature_extractor.aggregate_embed.weight = transformer_weights[
                     "text_embedding_projection.aggregate_embed.weight"
                 ]
@@ -907,18 +998,20 @@ class LTX2TextEncoder(nn.Module):
         prompt: str,
         max_length: int = 1024,
         return_audio_embeddings: bool = True,
-    ) -> Tuple[mx.array, mx.array]:
+    ) -> Tuple[mx.array, ...]:
         """Encode text prompt to video and audio embeddings.
 
         Args:
             prompt: Text prompt to encode
             max_length: Maximum token length (default 1024 to match official PyTorch)
-            return_audio_embeddings: If True, returns (video_emb, audio_emb).
-                                     If False, returns (video_emb, attention_mask).
+            return_audio_embeddings: If True, returns
+                (video_emb, audio_emb, connector_attention_mask).
+                If False, returns (video_emb, attention_mask).
 
         Returns:
-            Tuple of (video_embeddings, audio_embeddings) if return_audio_embeddings=True
-            Tuple of (video_embeddings, attention_mask) otherwise
+            Tuple of (video_embeddings, audio_embeddings, connector_attention_mask)
+            if return_audio_embeddings=True. Tuple of (video_embeddings, attention_mask)
+            otherwise.
         """
         if self.processor is None:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -932,6 +1025,7 @@ class LTX2TextEncoder(nn.Module):
         )
         input_ids = mx.array(inputs["input_ids"])
         attention_mask = mx.array(inputs["attention_mask"])
+        raw_valid_token_count = int(mx.sum(attention_mask).item())
 
         _, all_hidden_states = self.language_model(
             inputs=input_ids,
@@ -939,41 +1033,78 @@ class LTX2TextEncoder(nn.Module):
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
-        concat_hidden = norm_and_concat_hidden_states(
-            all_hidden_states, attention_mask, padding_side="left"
-        )
-        video_features = self.feature_extractor(concat_hidden)
+        if self.feature_extractor_variant == "v2":
+            normed_hidden = norm_and_concat_per_token_rms(
+                all_hidden_states, attention_mask
+            ).astype(all_hidden_states[0].dtype)
+            video_out_dim = self.feature_extractor.aggregate_embed.weight.shape[0]
+            video_features = self.feature_extractor.aggregate_embed(
+                rescale_norm(normed_hidden, video_out_dim, self.hidden_dim)
+            )
+        else:
+            concat_hidden = norm_and_concat_hidden_states(
+                all_hidden_states, attention_mask, padding_side="left"
+            )
+            video_features = self.feature_extractor(concat_hidden)
         additive_mask = (attention_mask - 1).astype(video_features.dtype)
         additive_mask = additive_mask.reshape(attention_mask.shape[0], 1, 1, -1) * 1e9
 
-        video_embeddings, _ = self.video_embeddings_connector(video_features, additive_mask)
-
+        video_embeddings, connector_attention_mask = self.video_embeddings_connector(
+            video_features, additive_mask
+        )
         if return_audio_embeddings:
-            audio_features = (
-                self.audio_feature_extractor(concat_hidden)
-                if self.audio_feature_extractor is not None
-                else video_features
-            )
+            if self.feature_extractor_variant == "v2":
+                audio_features = (
+                    self.audio_feature_extractor.aggregate_embed(
+                        rescale_norm(
+                            normed_hidden,
+                            self.audio_feature_extractor.aggregate_embed.weight.shape[
+                                0
+                            ],
+                            self.hidden_dim,
+                        )
+                    )
+                    if self.audio_feature_extractor is not None
+                    else video_features
+                )
+            else:
+                audio_features = (
+                    self.audio_feature_extractor(concat_hidden)
+                    if self.audio_feature_extractor is not None
+                    else video_features
+                )
             audio_embeddings, _ = self.audio_embeddings_connector(
                 audio_features, additive_mask
             )
-            return video_embeddings, audio_embeddings
+            return (
+                video_embeddings,
+                audio_embeddings,
+                (connector_attention_mask < 1e-6)
+                .astype(mx.int64)
+                .reshape(video_embeddings.shape[0], video_embeddings.shape[1]),
+            )
         else:
-            return video_embeddings, attention_mask
+            return (
+                video_embeddings,
+                (connector_attention_mask < 1e-6)
+                .astype(mx.int64)
+                .reshape(video_embeddings.shape[0], video_embeddings.shape[1]),
+            )
 
     def __call__(
         self,
         prompt: str,
         max_length: int = 1024,
         return_audio_embeddings: bool = True,
-    ) -> Tuple[mx.array, mx.array]:
+    ) -> Tuple[mx.array, ...]:
         """Encode text prompt.
 
         Args:
             prompt: Text prompt to encode
             max_length: Maximum token length (default 1024 to match official PyTorch)
-            return_audio_embeddings: If True, returns (video_emb, audio_emb).
-                                     If False, returns (video_emb, attention_mask).
+            return_audio_embeddings: If True, returns
+                (video_emb, audio_emb, attention_mask).
+                If False, returns (video_emb, attention_mask).
 
         Returns:
             Tuple of embeddings based on return_audio_embeddings flag

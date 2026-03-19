@@ -6,7 +6,14 @@ from typing import List
 import mlx.core as mx
 import mlx.nn as nn
 
-from .resnet import AMPBlock1, LRELU_SLOPE, ResBlock1, ResBlock2, SnakeBeta, leaky_relu
+from .resnet import (
+    AMPBlock1,
+    LRELU_SLOPE,
+    ResBlock1,
+    ResBlock2,
+    SnakeBeta,
+    leaky_relu,
+)
 
 
 class Vocoder(nn.Module):
@@ -57,7 +64,11 @@ class Vocoder(nn.Module):
 
         in_channels = 128 if stereo else 64
         self.conv_pre = nn.Conv1d(
-            in_channels, upsample_initial_channel, kernel_size=7, stride=1, padding=3
+            in_channels,
+            upsample_initial_channel,
+            kernel_size=7,
+            stride=1,
+            padding=3,
         )
 
         resblock_class = ResBlock1 if resblock == "1" else ResBlock2
@@ -103,10 +114,13 @@ class Vocoder(nn.Module):
         Forward pass of the vocoder.
         Args:
             x: Input Mel spectrogram tensor. Can be either:
-               - 3D: (batch_size, time, mel_bins) for mono - MLX format (N, L, C)
-               - 4D: (batch_size, 2, time, mel_bins) for stereo - PyTorch format (N, C, H, W)
+               - 3D: (batch_size, time, mel_bins) for mono
+                 MLX format (N, L, C)
+               - 4D: (batch_size, 2, time, mel_bins) for stereo
+                 PyTorch format (N, C, H, W)
         Returns:
-            Audio waveform tensor of shape (batch_size, out_channels, audio_length)
+            Audio waveform tensor of shape
+            (batch_size, out_channels, audio_length)
         """
         # Input: (batch, channels, time, mel_bins) from audio decoder
         # Transpose to (batch, channels, mel_bins, time)
@@ -248,7 +262,7 @@ class BigVGANVocoder(nn.Module):
             bias=use_bias_at_final,
         )
 
-        # Optional checkpoint-only tensors that appear in distilled vocoder weights.
+        # Optional checkpoint-only tensors from distilled vocoder checkpoints.
         self.mel_stft = _MelSTFT()
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -355,13 +369,27 @@ class VocoderWithBWE(nn.Module):
         return mel
 
     def _upsample_skip(self, x: mx.array) -> mx.array:
-        """Simple skip upsample to BWE sample rate.
+        """Upsample skip connection to BWE sample rate via linear interpolation.
 
-        Upstream uses a Hann-windowed sinc resampler. This uses nearest repeat
-        for now to preserve runtime portability in pure MLX.
+        Upstream uses a Hann-windowed sinc resampler. Linear interpolation is a
+        reasonable MLX-portable approximation that avoids the spectral-image
+        aliasing artefacts of nearest-neighbour repeat.
         """
         ratio = max(1, self.output_sampling_rate // self.input_sampling_rate)
-        return mx.repeat(x, ratio, axis=2)
+        if ratio <= 1:
+            return x
+        # x: (B, C, T) — transpose to (B, T, C) for gather, then back
+        x_btc = mx.transpose(x, (0, 2, 1))  # (B, T, C)
+        b, t, c = x_btc.shape
+        t_out = t * ratio
+        idx = mx.arange(t_out, dtype=mx.float32) / ratio
+        idx_floor = mx.clip(idx.astype(mx.int32), 0, t - 1)
+        idx_ceil = mx.clip(idx_floor + 1, 0, t - 1)
+        frac = (idx - idx_floor.astype(mx.float32)).reshape(1, t_out, 1)
+        lo = x_btc[:, idx_floor, :]  # (B, T_out, C)
+        hi = x_btc[:, idx_ceil, :]
+        out = lo + frac * (hi - lo)
+        return mx.transpose(out, (0, 2, 1))  # (B, C, T_out)
 
     def __call__(self, mel_spec: mx.array) -> mx.array:
         low = self.vocoder(mel_spec)  # (B, C, T_low)
@@ -371,5 +399,7 @@ class VocoderWithBWE(nn.Module):
         skip = self._upsample_skip(low)  # (B, C, T_high_approx)
 
         target = min(residual.shape[2], skip.shape[2])
-        out = residual[:, :, :target] + skip[:, :, :target]
-        return mx.clip(out, -1.0, 1.0)
+        residual = residual[:, :, :target]
+        skip = skip[:, :, :target]
+        pre_clip = residual + skip
+        return mx.clip(pre_clip, -1.0, 1.0)

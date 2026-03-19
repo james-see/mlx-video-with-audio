@@ -18,52 +18,139 @@ def leaky_relu(x: mx.array, negative_slope: float = LRELU_SLOPE) -> mx.array:
 
 
 class _SnakeCore(nn.Module):
-    """Core SnakeBeta activation with learnable alpha/beta."""
+    """Core SnakeBeta activation with learnable alpha/beta (log-scale)."""
 
     def __init__(self, channels: int):
         super().__init__()
-        self.alpha = mx.ones((channels,), dtype=mx.float32)
-        self.beta = mx.ones((channels,), dtype=mx.float32)
+        self.alpha = mx.zeros((channels,), dtype=mx.float32)
+        self.beta = mx.zeros((channels,), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
         # x is (B, L, C) for MLX Conv1d.
-        alpha = mx.reshape(self.alpha, (1, 1, -1))
-        beta = mx.reshape(self.beta, (1, 1, -1))
+        # Weights are stored in log-scale (BigVGAN convention with snake_logscale=True).
+        alpha = mx.exp(mx.reshape(self.alpha, (1, 1, -1)))
+        beta = mx.exp(mx.reshape(self.beta, (1, 1, -1)))
         return x + (mx.sin(alpha * x) ** 2) / (beta + 1e-6)
 
 
 class _SnakeFilter(nn.Module):
-    """Container for anti-aliased filter weights in pretrained checkpoints."""
+    """Kaiser-sinc low-pass filter for anti-aliased activation (Activation1d).
+
+    Checkpoint stores a (1, 1, taps) filter kernel.  At runtime we apply it as
+    a depth-wise 1-D convolution along the time axis (MLX layout: B, T, C).
+    """
 
     def __init__(self, taps: int = 12):
         super().__init__()
         self.filter = mx.zeros((1, 1, taps), dtype=mx.float32)
 
+    def _apply_filter(self, x: mx.array, stride: int = 1) -> mx.array:
+        """Depth-wise 1-D convolution with the stored kaiser-sinc kernel.
+
+        Args:
+            x: (B, T, C) — MLX channels-last layout.
+            stride: temporal stride (1 for upsample path, 2 for downsample).
+        Returns:
+            (B, T_out, C)
+        """
+        filt = self.filter  # (1, 1, taps)
+        taps = filt.shape[-1]
+        even = taps % 2 == 0
+        pad_left = taps // 2 - int(even)
+        pad_right = taps // 2
+
+        # x: (B, T, C) → (B, C, T) for grouped conv, then back
+        b, t, c = x.shape
+        x_bct = mx.transpose(x, (0, 2, 1))  # (B, C, T)
+
+        # Replicate-pad along time axis
+        left = mx.broadcast_to(x_bct[:, :, :1], (b, c, pad_left))
+        right = mx.broadcast_to(x_bct[:, :, -1:], (b, c, pad_right))
+        x_padded = mx.concatenate([left, x_bct, right], axis=2)  # (B, C, T+pad)
+
+        # Expand filter to (C, 1, taps) for depth-wise conv
+        filt_ckt = mx.broadcast_to(
+            mx.reshape(filt, (1, 1, taps)), (c, 1, taps)
+        )  # (C, 1, taps)
+
+        # Depth-wise conv: treat each channel independently
+        # MLX conv1d expects (B, T, C_in) input and (C_out, k, C_in) weight
+        # For grouped/depth-wise we process each channel as a separate batch item
+        x_flat = mx.reshape(x_padded, (b * c, 1, -1))  # (B*C, 1, T+pad)
+        x_flat = mx.transpose(x_flat, (0, 2, 1))  # (B*C, T+pad, 1)
+        w = mx.reshape(filt, (1, taps, 1))  # (1, taps, 1) — single-channel conv
+        out = mx.conv1d(x_flat, w, stride=stride)  # (B*C, T_out, 1)
+        out = mx.reshape(out, (b, c, -1))  # (B, C, T_out)
+        return mx.transpose(out, (0, 2, 1))  # (B, T_out, C)
+
+
+class _SnakeUpsample(_SnakeFilter):
+    """2x upsample using zero-insert + conv_transpose with kaiser-sinc filter."""
+
+    def __init__(self, taps: int = 12):
+        super().__init__(taps)
+
     def __call__(self, x: mx.array) -> mx.array:
-        # Runtime path currently keeps filtering as a no-op, but weights are loaded.
-        return x
+        """Upsample x by 2 using the stored filter.
+
+        Args:
+            x: (B, T, C)
+        Returns:
+            (B, T*2, C)
+        """
+        filt = self.filter  # (1, 1, taps)
+        taps = filt.shape[-1]
+        ratio = 2
+        pad = taps // ratio - 1
+        pad_left = pad * ratio + (taps - ratio) // 2
+        pad_right = pad * ratio + (taps - ratio + 1) // 2
+
+        b, t, c = x.shape
+        x_bct = mx.transpose(x, (0, 2, 1))  # (B, C, T)
+
+        # Replicate-pad
+        left = mx.broadcast_to(x_bct[:, :, :1], (b, c, pad))
+        right = mx.broadcast_to(x_bct[:, :, -1:], (b, c, pad))
+        x_padded = mx.concatenate([left, x_bct, right], axis=2)  # (B, C, T+2*pad)
+
+        # Transpose-conv per channel (zero-insert + filter)
+        # Process each channel independently
+        x_flat = mx.reshape(x_padded, (b * c, 1, -1))  # (B*C, 1, T_padded)
+        x_flat = mx.transpose(x_flat, (0, 2, 1))  # (B*C, T_padded, 1)
+        w = mx.reshape(filt, (1, taps, 1))  # (1, taps, 1)
+        out = ratio * mx.conv_transpose1d(x_flat, w, stride=ratio)  # (B*C, T_up, 1)
+        out = mx.reshape(out, (b, c, -1))  # (B, C, T_up)
+        out = out[:, :, pad_left:]
+        if pad_right > 0:
+            out = out[:, :, :-pad_right]
+        return mx.transpose(out, (0, 2, 1))  # (B, T_out, C)
 
 
 class _SnakeDownsample(nn.Module):
+    """2x downsample using low-pass filter + stride-2 convolution."""
+
     def __init__(self):
         super().__init__()
         self.lowpass = _SnakeFilter()
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.lowpass(x)
+        return self.lowpass._apply_filter(x, stride=2)
 
 
 class SnakeBeta(nn.Module):
-    """BigVGAN-style SnakeBeta activation wrapper."""
+    """BigVGAN-style SnakeBeta activation with anti-aliased Activation1d wrapper.
+
+    Pipeline: upsample 2x → SnakeBeta → low-pass filter + downsample 2x.
+    This prevents the sin²(αx) harmonics from aliasing back into the signal.
+    """
 
     def __init__(self, channels: int):
         super().__init__()
         self.act = _SnakeCore(channels)
-        self.upsample = _SnakeFilter()
+        self.upsample = _SnakeUpsample()
         self.downsample = _SnakeDownsample()
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Preserve learned parameters and submodules for checkpoint compatibility.
         x = self.upsample(x)
         x = self.act(x)
         x = self.downsample(x)

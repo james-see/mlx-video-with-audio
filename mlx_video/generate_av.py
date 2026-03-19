@@ -11,6 +11,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.utils as mx_utils
 import numpy as np
 from tqdm import tqdm
 
@@ -51,8 +52,124 @@ from mlx_video.conditioning.latent import LatentState, apply_denoise_mask
 
 
 # Distilled sigma schedules
-STAGE_1_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
-STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
+DEFAULT_STAGE_1_SIGMAS = [
+    1.0,
+    0.99375,
+    0.9875,
+    0.98125,
+    0.975,
+    0.909375,
+    0.725,
+    0.421875,
+    0.0,
+]
+DEFAULT_STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
+BASE_SHIFT_ANCHOR = 1024
+MAX_SHIFT_ANCHOR = 4096
+DEFAULT_NEGATIVE_PROMPT = (
+    "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, "
+    "grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, "
+    "deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, "
+    "wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of "
+    "field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent "
+    "lighting direction, color banding, cartoonish rendering, 3d cgi look, unrealistic materials, uncanny "
+    "valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, "
+    "mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, "
+    "off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward "
+    "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, "
+    "inconsistent tone, cinematic oversaturation, stylized filters, or ai artifacts."
+)
+
+
+def linear_quadratic_schedule(
+    num_steps: int, threshold_noise: float = 0.025, linear_steps: Optional[int] = None
+) -> list[float]:
+    """Match the official Lightricks LinearQuadratic sigma schedule."""
+    if num_steps <= 1:
+        return [1.0]
+    if linear_steps is None:
+        linear_steps = num_steps // 2
+    linear_sigma_schedule = [
+        i * threshold_noise / linear_steps for i in range(linear_steps)
+    ]
+    threshold_noise_step_diff = linear_steps - threshold_noise * num_steps
+    quadratic_steps = num_steps - linear_steps
+    quadratic_coef = threshold_noise_step_diff / (linear_steps * quadratic_steps**2)
+    linear_coef = threshold_noise / linear_steps - 2 * threshold_noise_step_diff / (
+        quadratic_steps**2
+    )
+    const = quadratic_coef * (linear_steps**2)
+    quadratic_sigma_schedule = [
+        quadratic_coef * (i**2) + linear_coef * i + const
+        for i in range(linear_steps, num_steps)
+    ]
+    sigma_schedule = linear_sigma_schedule + quadratic_sigma_schedule + [1.0]
+    sigma_schedule = [1.0 - x for x in sigma_schedule]
+    return sigma_schedule[:-1]
+
+
+def ltx2_schedule(
+    num_steps: int,
+    tokens: Optional[int],
+    max_shift: float = 2.05,
+    base_shift: float = 0.95,
+    stretch: bool = True,
+    terminal: float = 0.1,
+) -> list[float]:
+    """Match official LTX2Scheduler with token-dependent sigma shifting."""
+    if num_steps < 1:
+        raise ValueError("num_steps must be at least 1")
+
+    token_count = tokens if tokens is not None else MAX_SHIFT_ANCHOR
+    sigmas = np.linspace(1.0, 0.0, num_steps + 1, dtype=np.float64)
+
+    x1 = BASE_SHIFT_ANCHOR
+    x2 = MAX_SHIFT_ANCHOR
+    mm = (max_shift - base_shift) / (x2 - x1)
+    b = base_shift - mm * x1
+    sigma_shift = token_count * mm + b
+
+    non_zero_mask = sigmas != 0
+    exp_shift = np.exp(sigma_shift)
+    sigmas[non_zero_mask] = exp_shift / (
+        exp_shift + (1.0 / sigmas[non_zero_mask] - 1.0)
+    )
+
+    if stretch:
+        non_zero_sigmas = sigmas[non_zero_mask]
+        if non_zero_sigmas.size > 0:
+            one_minus = 1.0 - non_zero_sigmas
+            scale_factor = one_minus[-1] / (1.0 - terminal)
+            stretched = 1.0 - (one_minus / scale_factor)
+            sigmas[non_zero_mask] = stretched
+
+    return [float(x) for x in sigmas.astype(np.float32)]
+
+
+def build_stage_sigma_schedules(
+    num_inference_steps: int,
+    stage1_token_count: Optional[int] = None,
+    use_ltx2_scheduler: bool = True,
+) -> tuple[list[float], list[float]]:
+    """Derive stage schedules from one total step count, matching app semantics."""
+    if num_inference_steps < 2:
+        raise ValueError("num_inference_steps must be at least 2")
+    if num_inference_steps == 11:
+        return DEFAULT_STAGE_1_SIGMAS, DEFAULT_STAGE_2_SIGMAS
+
+    stage1_steps = max(2, round(num_inference_steps * 8 / 11))
+    stage2_steps = max(1, num_inference_steps - stage1_steps)
+    if stage1_steps + stage2_steps != num_inference_steps:
+        stage2_steps = num_inference_steps - stage1_steps
+
+    if use_ltx2_scheduler and stage1_token_count is not None:
+        full_schedule = ltx2_schedule(num_inference_steps, tokens=stage1_token_count)
+    else:
+        full_schedule = linear_quadratic_schedule(num_inference_steps)
+    stage1_sigmas = full_schedule[: stage1_steps + 1]
+    stage2_sigmas = full_schedule[stage1_steps:]
+    return stage1_sigmas, stage2_sigmas
+
 
 # Default HuggingFace model for text encoder (only used when NOT using unified MLX model)
 DEFAULT_HF_MODEL = "Lightricks/LTX-2"
@@ -288,6 +405,31 @@ def compute_audio_frames(num_video_frames: int, fps: float) -> int:
     return round(duration * AUDIO_LATENTS_PER_SECOND)
 
 
+def _to_velocity(
+    noisy: mx.array,
+    denoised: mx.array,
+    sigma: float,
+    calc_dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    sigma_arr = mx.array(sigma, dtype=calc_dtype)
+    return (
+        (noisy.astype(calc_dtype) - denoised.astype(calc_dtype)) / sigma_arr
+    ).astype(noisy.dtype)
+
+
+def _euler_step(
+    sample: mx.array,
+    denoised_sample: mx.array,
+    sigma: float,
+    sigma_next: float,
+    calc_dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    velocity = _to_velocity(sample, denoised_sample, sigma, calc_dtype=calc_dtype)
+    dt = mx.array(sigma_next - sigma, dtype=calc_dtype)
+    stepped = sample.astype(calc_dtype) + velocity.astype(calc_dtype) * dt
+    return stepped.astype(sample.dtype)
+
+
 def denoise_av(
     video_latents: mx.array,
     audio_latents: mx.array,
@@ -295,11 +437,17 @@ def denoise_av(
     audio_positions: mx.array,
     video_embeddings: mx.array,
     audio_embeddings: mx.array,
+    video_embeddings_negative: Optional[mx.array],
+    audio_embeddings_negative: Optional[mx.array],
     transformer: LTXModel,
     sigmas: list,
     verbose: bool = True,
     video_state: Optional[LatentState] = None,
     stage: int = 1,
+    audio_enabled: bool = True,
+    cfg_scale: float = 1.0,
+    use_gradient_estimation: bool = False,
+    ge_gamma: float = 2.0,
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for audio-video generation with optional I2V conditioning.
 
@@ -310,11 +458,17 @@ def denoise_av(
         audio_positions: Audio position embeddings
         video_embeddings: Video text embeddings
         audio_embeddings: Audio text embeddings
+        video_embeddings_negative: Negative video text embeddings for CFG
+        audio_embeddings_negative: Negative audio text embeddings for CFG
         transformer: LTX model
         sigmas: List of sigma values
         verbose: Whether to show progress bar
         video_state: Optional LatentState for I2V conditioning
         stage: Stage number for progress logging (1 or 2)
+        audio_enabled: Whether to enable the audio branch and AV coupling
+        cfg_scale: Classifier-free guidance scale (1.0 disables CFG)
+        use_gradient_estimation: Whether to use gradient estimating Euler updates
+        ge_gamma: Gradient estimation coefficient
 
     Returns:
         Tuple of (video_latents, audio_latents)
@@ -323,6 +477,14 @@ def denoise_av(
     # If video state is provided, use its latent
     if video_state is not None:
         video_latents = video_state.latent
+
+    cfg_enabled = (
+        cfg_scale > 1.0
+        and video_embeddings_negative is not None
+        and audio_embeddings_negative is not None
+    )
+    previous_video_velocity = None
+    previous_audio_velocity = None
 
     total_steps = len(sigmas) - 1
     for i in tqdm(range(total_steps), desc="Denoising A/V", disable=not verbose):
@@ -333,7 +495,6 @@ def denoise_av(
             flush=True,
         )
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
-
         # Flatten video latents
         b, c, f, h, w = video_latents.shape
         num_video_tokens = f * h * w
@@ -362,34 +523,103 @@ def denoise_av(
             timesteps=video_timesteps,
             positions=video_positions,
             context=video_embeddings,
+            sigma=None,
             context_mask=None,
             enabled=True,
         )
 
-        audio_modality = Modality(
-            latent=audio_flat,
-            timesteps=mx.full((ab, at), sigma, dtype=dtype),
-            positions=audio_positions,
-            context=audio_embeddings,
-            context_mask=None,
-            enabled=True,
+        audio_modality = (
+            Modality(
+                latent=audio_flat,
+                timesteps=mx.full((ab, at), sigma, dtype=dtype),
+                positions=audio_positions,
+                context=audio_embeddings,
+                sigma=None,
+                context_mask=None,
+                enabled=True,
+            )
+            if audio_enabled
+            else None
         )
-
-        video_velocity, audio_velocity = transformer(
+        video_velocity_pos, audio_velocity_pos = transformer(
             video=video_modality, audio=audio_modality
         )
-        mx.eval(video_velocity, audio_velocity)
+        if audio_velocity_pos is not None:
+            mx.eval(video_velocity_pos, audio_velocity_pos)
+        else:
+            mx.eval(video_velocity_pos)
+
+        video_velocity_neg = None
+        audio_velocity_neg = None
+        if cfg_enabled:
+            video_modality_negative = Modality(
+                latent=video_flat,
+                timesteps=video_timesteps,
+                positions=video_positions,
+                context=video_embeddings_negative,
+                sigma=None,
+                context_mask=None,
+                enabled=True,
+            )
+            audio_modality_negative = (
+                Modality(
+                    latent=audio_flat,
+                    timesteps=mx.full((ab, at), sigma, dtype=dtype),
+                    positions=audio_positions,
+                    context=audio_embeddings_negative,
+                    sigma=None,
+                    context_mask=None,
+                    enabled=True,
+                )
+                if audio_enabled
+                else None
+            )
+            video_velocity_neg, audio_velocity_neg = transformer(
+                video=video_modality_negative, audio=audio_modality_negative
+            )
+            if audio_velocity_neg is not None:
+                mx.eval(video_velocity_neg, audio_velocity_neg)
+            else:
+                mx.eval(video_velocity_neg)
 
         # Reshape velocities back
-        video_velocity = mx.reshape(
-            mx.transpose(video_velocity, (0, 2, 1)), (b, c, f, h, w)
+        video_velocity_pos = mx.reshape(
+            mx.transpose(video_velocity_pos, (0, 2, 1)), (b, c, f, h, w)
         )
-        audio_velocity = mx.reshape(audio_velocity, (ab, at, ac, af))
-        audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))  # (B, C, T, F)
+        if audio_velocity_pos is not None:
+            audio_velocity_pos = mx.reshape(audio_velocity_pos, (ab, at, ac, af))
+            audio_velocity_pos = mx.transpose(audio_velocity_pos, (0, 2, 1, 3))
+        if video_velocity_neg is not None:
+            video_velocity_neg = mx.reshape(
+                mx.transpose(video_velocity_neg, (0, 2, 1)), (b, c, f, h, w)
+            )
+        if audio_velocity_neg is not None:
+            audio_velocity_neg = mx.reshape(audio_velocity_neg, (ab, at, ac, af))
+            audio_velocity_neg = mx.transpose(audio_velocity_neg, (0, 2, 1, 3))
 
         # Compute denoised
-        video_denoised = to_denoised(video_latents, video_velocity, sigma)
-        audio_denoised = to_denoised(audio_latents, audio_velocity, sigma)
+        video_denoised = to_denoised(video_latents, video_velocity_pos, sigma)
+        audio_denoised = (
+            to_denoised(audio_latents, audio_velocity_pos, sigma)
+            if audio_velocity_pos is not None
+            else audio_latents
+        )
+        if cfg_enabled and video_velocity_neg is not None:
+            video_denoised_negative = to_denoised(
+                video_latents, video_velocity_neg, sigma
+            )
+            cfg_delta = mx.array(cfg_scale - 1.0, dtype=video_denoised.dtype)
+            video_denoised = video_denoised + cfg_delta * (
+                video_denoised - video_denoised_negative
+            )
+            if audio_velocity_neg is not None:
+                audio_denoised_negative = to_denoised(
+                    audio_latents, audio_velocity_neg, sigma
+                )
+                audio_cfg_delta = mx.array(cfg_scale - 1.0, dtype=audio_denoised.dtype)
+                audio_denoised = audio_denoised + audio_cfg_delta * (
+                    audio_denoised - audio_denoised_negative
+                )
 
         # Apply conditioning mask for video if state is provided
         if video_state is not None:
@@ -399,21 +629,50 @@ def denoise_av(
 
         mx.eval(video_denoised, audio_denoised)
 
-        # Euler step - use dtype-preserving arrays to avoid float32 promotion
+        # Optional gradient-estimating correction before the Euler step.
+        if use_gradient_estimation and sigma_next > 0:
+            current_video_velocity = _to_velocity(video_latents, video_denoised, sigma)
+            if previous_video_velocity is not None:
+                delta_velocity = current_video_velocity - previous_video_velocity
+                total_velocity = (
+                    mx.array(ge_gamma, dtype=current_video_velocity.dtype)
+                    * delta_velocity
+                    + previous_video_velocity
+                )
+                video_denoised = to_denoised(video_latents, total_velocity, sigma)
+            previous_video_velocity = current_video_velocity
+
+            if audio_velocity_pos is not None:
+                current_audio_velocity = _to_velocity(
+                    audio_latents, audio_denoised, sigma
+                )
+                if previous_audio_velocity is not None:
+                    delta_audio_velocity = (
+                        current_audio_velocity - previous_audio_velocity
+                    )
+                    total_audio_velocity = (
+                        mx.array(ge_gamma, dtype=current_audio_velocity.dtype)
+                        * delta_audio_velocity
+                        + previous_audio_velocity
+                    )
+                    audio_denoised = to_denoised(
+                        audio_latents, total_audio_velocity, sigma
+                    )
+                previous_audio_velocity = current_audio_velocity
+
+        # Official Euler step in float32 for stability.
         if sigma_next > 0:
-            sigma_next_arr = mx.array(sigma_next, dtype=dtype)
-            sigma_arr = mx.array(sigma, dtype=dtype)
-            video_latents = (
-                video_denoised
-                + sigma_next_arr * (video_latents - video_denoised) / sigma_arr
+            video_latents = _euler_step(
+                video_latents, video_denoised, sigma, sigma_next
             )
-            audio_latents = (
-                audio_denoised
-                + sigma_next_arr * (audio_latents - audio_denoised) / sigma_arr
-            )
+            if audio_velocity_pos is not None:
+                audio_latents = _euler_step(
+                    audio_latents, audio_denoised, sigma, sigma_next
+                )
         else:
             video_latents = video_denoised
-            audio_latents = audio_denoised
+            if audio_velocity_pos is not None:
+                audio_latents = audio_denoised
         mx.eval(video_latents, audio_latents)
 
     return video_latents, audio_latents
@@ -428,6 +687,20 @@ def load_audio_decoder(model_path: Path, use_unified: bool = False):
     """
     from mlx_video.models.ltx.audio_vae import AudioDecoder, CausalityAxis, NormType
 
+    embedded_audio_cfg = {}
+    embedded_stft_cfg = {}
+    embedded_cfg_path = model_path / "embedded_config.json"
+    if embedded_cfg_path.exists():
+        try:
+            with open(embedded_cfg_path, "r") as f:
+                embedded_root_cfg = json.load(f)
+            embedded_audio_cfg = embedded_root_cfg.get("audio_vae", {}).get(
+                "preprocessing", {}
+            )
+            embedded_stft_cfg = embedded_audio_cfg.get("stft", {})
+        except (json.JSONDecodeError, OSError):
+            pass
+
     decoder = AudioDecoder(
         ch=128,
         out_ch=2,  # stereo
@@ -440,7 +713,6 @@ def load_audio_decoder(model_path: Path, use_unified: bool = False):
         causality_axis=CausalityAxis.HEIGHT,
         mel_bins=64,  # Output mel bins
     )
-
     if use_unified:
         # Load from unified MLX model (weights already sanitized)
         sanitized = load_unified_weights(model_path, "audio_vae.")
@@ -596,7 +868,6 @@ def load_vocoder(model_path: Path, use_unified: bool = False):
             stereo=True,
             output_sample_rate=AUDIO_SAMPLE_RATE,
         )
-
     if use_unified:
         # Load from unified MLX model (weights already sanitized)
         sanitized = load_unified_weights(model_path, "vocoder.")
@@ -641,7 +912,10 @@ def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RA
         # (channels, samples) -> (samples, channels)
         audio = audio.T
 
-    # Normalize and convert to int16
+    # Peak-normalize so the loudest sample hits ±0.95, then convert to int16
+    peak = np.max(np.abs(audio))
+    if peak > 1e-6:
+        audio = audio * (0.95 / peak)
     audio = np.clip(audio, -1.0, 1.0)
     audio_int16 = (audio * 32767).astype(np.int16)
 
@@ -694,6 +968,8 @@ def generate_video_with_audio(
     output_path: str = "output_av.mp4",
     output_audio_path: Optional[str] = None,
     save_audio_separately: bool = False,
+    negative_prompt: Optional[str] = DEFAULT_NEGATIVE_PROMPT,
+    cfg_scale: float = 3.0,
     verbose: bool = True,
     enhance_prompt: bool = False,
     use_uncensored_enhancer: bool = False,
@@ -703,6 +979,7 @@ def generate_video_with_audio(
     image_strength: float = 1.0,
     image_frame_idx: int = 0,
     tiling: str = "auto",
+    num_inference_steps: int = 30,
 ):
     """Generate video with synchronized audio from text prompt, optionally conditioned on an image.
 
@@ -717,6 +994,8 @@ def generate_video_with_audio(
         fps: Frames per second
         output_path: Output video path
         output_audio_path: Output audio path
+        negative_prompt: Optional negative prompt for CFG
+        cfg_scale: CFG scale (1.0 disables CFG)
         verbose: Whether to print progress
         enhance_prompt: Whether to enhance prompt using Gemma
         max_tokens: Max tokens for prompt enhancement
@@ -725,6 +1004,7 @@ def generate_video_with_audio(
         image_strength: Conditioning strength (1.0 = full denoise)
         image_frame_idx: Frame index to condition (0 = first frame)
         tiling: Tiling mode for VAE decoding (auto/none/default/aggressive/conservative/spatial/temporal)
+        num_inference_steps: Total denoising steps across both stages
     """
     start_time = time.time()
 
@@ -791,6 +1071,12 @@ def generate_video_with_audio(
     stage1_h, stage1_w = height // 2 // 32, width // 2 // 32
     stage2_h, stage2_w = height // 32, width // 32
     latent_frames = 1 + (num_frames - 1) // 8
+    stage1_token_count = latent_frames * stage1_h * stage1_w
+    stage1_sigmas, stage2_sigmas = build_stage_sigma_schedules(
+        num_inference_steps,
+        stage1_token_count=stage1_token_count,
+        use_ltx2_scheduler=True,
+    )
 
     mx.random.seed(seed)
 
@@ -861,9 +1147,35 @@ def generate_video_with_audio(
             )
 
     # Get both video and audio embeddings
-    video_embeddings, audio_embeddings = text_encoder(prompt)
+    video_embeddings, audio_embeddings, text_attention_mask = text_encoder(
+        prompt, max_length=1024
+    )
+    negative_prompt = (
+        DEFAULT_NEGATIVE_PROMPT if negative_prompt is None else negative_prompt
+    )
+    cfg_enabled = cfg_scale > 1.0 and bool(str(negative_prompt).strip())
+    if cfg_enabled:
+        (
+            video_embeddings_negative,
+            audio_embeddings_negative,
+            negative_attention_mask,
+        ) = text_encoder(negative_prompt, max_length=1024)
+    else:
+        video_embeddings_negative = None
+        audio_embeddings_negative = None
+        negative_attention_mask = None
+
     model_dtype = video_embeddings.dtype  # bfloat16 from text encoder
-    mx.eval(video_embeddings, audio_embeddings)
+    tensors_to_eval = [video_embeddings, audio_embeddings, text_attention_mask]
+    if video_embeddings_negative is not None:
+        tensors_to_eval.extend(
+            [
+                video_embeddings_negative,
+                audio_embeddings_negative,
+                negative_attention_mask,
+            ]
+        )
+    mx.eval(*tensors_to_eval)
 
     del text_encoder
     mx.clear_cache()
@@ -889,11 +1201,16 @@ def generate_video_with_audio(
     caption_proj_second = True
     apply_gated_attention = False
     adaln_embedding_coefficient = 6
+    embedded_transformer_cfg = {}
+    embedded_scheduler_cfg = {}
     embedded_cfg_path = model_path / "embedded_config.json"
     if embedded_cfg_path.exists():
         try:
             with open(embedded_cfg_path, "r") as f:
-                t_cfg = json.load(f).get("transformer", {})
+                embedded_root_cfg = json.load(f)
+            t_cfg = embedded_root_cfg.get("transformer", {})
+            embedded_transformer_cfg = t_cfg
+            embedded_scheduler_cfg = embedded_root_cfg.get("scheduler", {})
             caption_proj_first = t_cfg.get("caption_projection_first_linear", True)
             caption_proj_second = t_cfg.get("caption_projection_second_linear", True)
             apply_gated_attention = bool(t_cfg.get("apply_gated_attention", False))
@@ -944,7 +1261,6 @@ def generate_video_with_audio(
         use_middle_indices_grid=True,
         timestep_scale_multiplier=1000,
     )
-
     transformer = LTXModel(config)
 
     # Detect quantized model and selectively quantize layers that have quantized weights
@@ -1015,7 +1331,7 @@ def generate_video_with_audio(
 
     # Initialize latents
     print(
-        f"{Colors.YELLOW}⚡ Stage 1: Generating at {width//2}x{height//2} (8 steps)...{Colors.RESET}"
+        f"{Colors.YELLOW}⚡ Stage 1: Generating at {width//2}x{height//2} ({len(stage1_sigmas) - 1} steps)...{Colors.RESET}"
     )
     mx.random.seed(seed)
 
@@ -1046,7 +1362,7 @@ def generate_video_with_audio(
 
         # Apply noiser: latent = noise * (mask * noise_scale) + latent * (1 - mask * noise_scale)
         noise = mx.random.normal(video_latent_shape).astype(model_dtype)
-        noise_scale = mx.array(STAGE_1_SIGMAS[0], dtype=model_dtype)  # 1.0
+        noise_scale = mx.array(stage1_sigmas[0], dtype=model_dtype)  # 1.0
         scaled_mask = video_state1.denoise_mask * noise_scale
         video_state1 = LatentState(
             latent=noise * scaled_mask
@@ -1066,7 +1382,6 @@ def generate_video_with_audio(
         (1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS)
     ).astype(model_dtype)
     mx.eval(audio_latents)
-
     # Stage 1 denoising
     video_latents, audio_latents = denoise_av(
         video_latents,
@@ -1075,11 +1390,14 @@ def generate_video_with_audio(
         audio_positions,
         video_embeddings,
         audio_embeddings,
+        video_embeddings_negative,
+        audio_embeddings_negative,
         transformer,
-        STAGE_1_SIGMAS,
+        stage1_sigmas,
         verbose=verbose,
         video_state=video_state1,
         stage=1,
+        cfg_scale=cfg_scale,
     )
 
     # Upsample video latents
@@ -1127,7 +1445,7 @@ def generate_video_with_audio(
 
     # Stage 2: Refine at full resolution
     print(
-        f"{Colors.YELLOW}⚡ Stage 2: Refining at {width}x{height} (3 steps)...{Colors.RESET}"
+        f"{Colors.YELLOW}⚡ Stage 2: Refining at {width}x{height} ({len(stage2_sigmas) - 1} steps)...{Colors.RESET}"
     )
     # Position grids stay float32 for RoPE precision
     video_positions = create_video_position_grid(
@@ -1153,7 +1471,7 @@ def generate_video_with_audio(
 
         # Apply noiser: conditioned frames (mask=0) keep image latent, unconditioned get partial noise
         video_noise = mx.random.normal(video_latents.shape).astype(model_dtype)
-        noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
+        noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
         scaled_mask = video_state2.denoise_mask * noise_scale
         video_state2 = LatentState(
             latent=video_noise * scaled_mask
@@ -1171,7 +1489,7 @@ def generate_video_with_audio(
         mx.eval(audio_latents)
     else:
         # T2V: add noise to all frames for refinement
-        noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
+        noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
         one_minus_scale = mx.array(1.0, dtype=model_dtype) - noise_scale
         video_noise = mx.random.normal(video_latents.shape).astype(model_dtype)
         audio_noise = mx.random.normal(audio_latents.shape).astype(model_dtype)
@@ -1186,11 +1504,16 @@ def generate_video_with_audio(
         audio_positions,
         video_embeddings,
         audio_embeddings,
+        video_embeddings_negative,
+        audio_embeddings_negative,
         transformer,
-        STAGE_2_SIGMAS,
+        stage2_sigmas,
         verbose=verbose,
         video_state=video_state2,
         stage=2,
+        cfg_scale=cfg_scale,
+        use_gradient_estimation=True,
+        ge_gamma=2.0,
     )
 
     del transformer
@@ -1412,6 +1735,28 @@ Examples:
     parser.add_argument(
         "--text-encoder-repo", type=str, default=None, help="Text encoder repository"
     )
+    parser.add_argument(
+        "--num-inference-steps",
+        "--steps",
+        dest="num_inference_steps",
+        type=int,
+        default=30,
+        help="Total denoising steps across both stages (default: 30, matches app)",
+    )
+    parser.add_argument(
+        "--negative-prompt",
+        type=str,
+        default=DEFAULT_NEGATIVE_PROMPT,
+        help="Negative prompt for CFG guidance (default: official LTX negative prompt)",
+    )
+    parser.add_argument(
+        "--cfg-scale",
+        "--guidance-scale",
+        dest="cfg_scale",
+        type=float,
+        default=3.0,
+        help="Classifier-free guidance scale (default: 3.0, set 1.0 to disable)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
         "--enhance-prompt", action="store_true", help="Enhance prompt using Gemma"
@@ -1478,6 +1823,9 @@ Examples:
         num_frames=args.num_frames,
         seed=args.seed,
         fps=args.fps,
+        num_inference_steps=args.num_inference_steps,
+        negative_prompt=args.negative_prompt,
+        cfg_scale=args.cfg_scale,
         output_path=args.output_path,
         output_audio_path=args.output_audio,
         save_audio_separately=args.save_audio_separately,

@@ -147,10 +147,13 @@ class Attention(nn.Module):
         # Apply per-head gating if available
         if self.to_gate_logits is not None:
             B, S, _ = x.shape
-            gates = mx.sigmoid(self.to_gate_logits(x))
-            gates = mx.expand_dims(gates, axis=-1)
             out_reshaped = out.reshape(B, S, self.heads, self.dim_head)
-            out = (out_reshaped * gates).reshape(B, S, -1)
+            gate_logits = self.to_gate_logits(x)
+            gates = mx.sigmoid(gate_logits)
+            gates = mx.expand_dims(gates, axis=-1)
+            # Upstream uses 2 * sigmoid so zero-init gates are identity, not 0.5x.
+            gated_out = (out_reshaped * (2.0 * gates)).reshape(B, S, -1)
+            out = gated_out
 
         # Project output
         return self.to_out(out)

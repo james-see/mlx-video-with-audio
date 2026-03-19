@@ -16,6 +16,7 @@ class Modality:
     timesteps: mx.array
     positions: mx.array
     context: mx.array
+    sigma: Optional[mx.array] = None
     enabled: bool = True
     context_mask: Optional[mx.array] = None
 
@@ -86,7 +87,7 @@ class BasicAVTransformerBlock(nn.Module):
             )
             self.ff = FeedForward(video.dim, dim_out=video.dim)
             self.scale_shift_table = mx.zeros((6, video.dim))
-            self.prompt_scale_shift_table = None
+            self.prompt_scale_shift_table = mx.zeros((2, video.dim))
 
         # Audio components
         if audio is not None:
@@ -110,7 +111,7 @@ class BasicAVTransformerBlock(nn.Module):
             )
             self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
             self.audio_scale_shift_table = mx.zeros((6, audio.dim))
-            self.audio_prompt_scale_shift_table = None
+            self.audio_prompt_scale_shift_table = mx.zeros((2, audio.dim))
 
         # Cross-modal attention (when both video and audio are enabled)
         if audio is not None and video is not None:
@@ -257,7 +258,7 @@ class BasicAVTransformerBlock(nn.Module):
             self.scale_shift_table.shape[0] if hasattr(self, "scale_shift_table") else 6
         )
         v_has_ca_ada = v_num_ada >= 9
-        v_ff_start = 6 if v_has_ca_ada else 3
+        v_ff_start = 3
 
         a_num_ada = (
             self.audio_scale_shift_table.shape[0]
@@ -265,7 +266,7 @@ class BasicAVTransformerBlock(nn.Module):
             else 6
         )
         a_has_ca_ada = a_num_ada >= 9
-        a_ff_start = 6 if a_has_ca_ada else 3
+        a_ff_start = 3
 
         # Process video self-attention and cross-attention with text
         if run_vx:
@@ -279,14 +280,14 @@ class BasicAVTransformerBlock(nn.Module):
             v_context = video.context
             if self.prompt_scale_shift_table is not None:
                 if video.prompt_timestep is not None:
-                    p_scale, p_shift = self.get_ada_values(
+                    p_shift, p_scale = self.get_ada_values(
                         self.prompt_scale_shift_table,
                         vx.shape[0],
                         video.prompt_timestep,
                         slice(0, 2),
                     )
                 else:
-                    p_scale, p_shift = (
+                    p_shift, p_scale = (
                         self.prompt_scale_shift_table[0],
                         self.prompt_scale_shift_table[1],
                     )
@@ -294,7 +295,7 @@ class BasicAVTransformerBlock(nn.Module):
 
             if v_has_ca_ada:
                 vshift_ca, vscale_ca, vgate_ca = self.get_ada_values(
-                    self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
+                    self.scale_shift_table, vx.shape[0], video.timesteps, slice(6, 9)
                 )
                 norm_vx_ca = (
                     rms_norm(vx, eps=self.norm_eps) * (1 + vscale_ca) + vshift_ca
@@ -330,14 +331,14 @@ class BasicAVTransformerBlock(nn.Module):
             a_context = audio.context
             if self.audio_prompt_scale_shift_table is not None:
                 if audio.prompt_timestep is not None:
-                    ap_scale, ap_shift = self.get_ada_values(
+                    ap_shift, ap_scale = self.get_ada_values(
                         self.audio_prompt_scale_shift_table,
                         ax.shape[0],
                         audio.prompt_timestep,
                         slice(0, 2),
                     )
                 else:
-                    ap_scale, ap_shift = (
+                    ap_shift, ap_scale = (
                         self.audio_prompt_scale_shift_table[0],
                         self.audio_prompt_scale_shift_table[1],
                     )
@@ -348,7 +349,7 @@ class BasicAVTransformerBlock(nn.Module):
                     self.audio_scale_shift_table,
                     ax.shape[0],
                     audio.timesteps,
-                    slice(3, 6),
+                    slice(6, 9),
                 )
                 norm_ax_ca = (
                     rms_norm(ax, eps=self.norm_eps) * (1 + ascale_ca) + ashift_ca

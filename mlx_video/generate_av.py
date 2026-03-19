@@ -447,6 +447,7 @@ def denoise_av(
     cfg_scale: float = 1.0,
     use_gradient_estimation: bool = False,
     ge_gamma: float = 2.0,
+    use_legacy_euler: bool = False,
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for audio-video generation with optional I2V conditioning.
 
@@ -468,6 +469,7 @@ def denoise_av(
         cfg_scale: Classifier-free guidance scale (1.0 disables CFG)
         use_gradient_estimation: Whether to use gradient estimating Euler updates
         ge_gamma: Gradient estimation coefficient
+        use_legacy_euler: If True, use pre-2.3 dtype-preserving Euler update (LTX-2 Unified parity)
 
     Returns:
         Tuple of (video_latents, audio_latents)
@@ -629,7 +631,7 @@ def denoise_av(
         mx.eval(video_denoised, audio_denoised)
 
         # Optional gradient-estimating correction before the Euler step.
-        if use_gradient_estimation and sigma_next > 0:
+        if use_gradient_estimation and sigma_next > 0 and not use_legacy_euler:
             current_video_velocity = _to_velocity(video_latents, video_denoised, sigma)
             if previous_video_velocity is not None:
                 delta_velocity = current_video_velocity - previous_video_velocity
@@ -659,8 +661,25 @@ def denoise_av(
                     )
                 previous_audio_velocity = current_audio_velocity
 
-        # Official Euler step in float32 for stability.
-        if sigma_next > 0:
+        # Euler update: legacy (pre-2.3 unified) vs rectified-flow style float32 step.
+        if use_legacy_euler:
+            if sigma_next > 0:
+                sigma_next_arr = mx.array(sigma_next, dtype=dtype)
+                sigma_arr = mx.array(sigma, dtype=dtype)
+                video_latents = (
+                    video_denoised
+                    + sigma_next_arr * (video_latents - video_denoised) / sigma_arr
+                )
+                if audio_velocity_pos is not None:
+                    audio_latents = (
+                        audio_denoised
+                        + sigma_next_arr * (audio_latents - audio_denoised) / sigma_arr
+                    )
+            else:
+                video_latents = video_denoised
+                if audio_velocity_pos is not None:
+                    audio_latents = audio_denoised
+        elif sigma_next > 0:
             video_latents = _euler_step(
                 video_latents, video_denoised, sigma, sigma_next
             )
@@ -979,6 +998,7 @@ def generate_video_with_audio(
     image_frame_idx: int = 0,
     tiling: str = "auto",
     num_inference_steps: int = 30,
+    no_audio: bool = False,
 ):
     """Generate video with synchronized audio from text prompt, optionally conditioned on an image.
 
@@ -1004,6 +1024,7 @@ def generate_video_with_audio(
         image_frame_idx: Frame index to condition (0 = first frame)
         tiling: Tiling mode for VAE decoding (auto/none/default/aggressive/conservative/spatial/temporal)
         num_inference_steps: Total denoising steps across both stages
+        no_audio: If True, skip audio decode/mux (video-only MP4). Full A/V denoising still runs.
     """
     start_time = time.time()
 
@@ -1095,11 +1116,23 @@ def generate_video_with_audio(
     stage2_h, stage2_w = height // 32, width // 32
     latent_frames = 1 + (num_frames - 1) // 8
     stage1_token_count = latent_frames * stage1_h * stage1_w
-    stage1_sigmas, stage2_sigmas = build_stage_sigma_schedules(
-        num_inference_steps,
-        stage1_token_count=stage1_token_count,
-        use_ltx2_scheduler=use_ltx2_scheduler,
-    )
+    # Pre-2.3 notapalindrome unified builds used fixed distilled stage sigmas + legacy Euler,
+    # not dynamic schedules tied to --steps. Keep that behavior for unified non-2.3 only.
+    legacy_unified_sampler = use_unified and not ltx_23_model
+    if legacy_unified_sampler:
+        stage1_sigmas = list(DEFAULT_STAGE_1_SIGMAS)
+        stage2_sigmas = list(DEFAULT_STAGE_2_SIGMAS)
+        print(
+            f"{Colors.DIM}LTX-2 Unified classic path: fixed stage sigmas "
+            f"(stage1={len(stage1_sigmas) - 1} + stage2={len(stage2_sigmas) - 1} denoise steps; "
+            f"--steps ignored for sampler parity with pre-2.3 releases).{Colors.RESET}"
+        )
+    else:
+        stage1_sigmas, stage2_sigmas = build_stage_sigma_schedules(
+            num_inference_steps,
+            stage1_token_count=stage1_token_count,
+            use_ltx2_scheduler=use_ltx2_scheduler,
+        )
 
     mx.random.seed(seed)
 
@@ -1420,6 +1453,7 @@ def generate_video_with_audio(
         video_state=video_state1,
         stage=1,
         cfg_scale=effective_cfg_scale,
+        use_legacy_euler=legacy_unified_sampler,
     )
 
     # Upsample video latents
@@ -1535,6 +1569,7 @@ def generate_video_with_audio(
         cfg_scale=effective_cfg_scale,
         use_gradient_estimation=ltx_23_model,
         ge_gamma=2.0,
+        use_legacy_euler=legacy_unified_sampler,
     )
 
     del transformer
@@ -1593,6 +1628,49 @@ def generate_video_with_audio(
     video = (video * 255).astype(mx.uint8)
     video_np = np.array(video)
 
+    del vae_decoder
+    mx.clear_cache()
+
+    # Save outputs
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Save video (temporary without audio when muxing)
+    temp_video_path = output_path.with_suffix(".temp.mp4")
+
+    try:
+        import cv2
+
+        h, w = video_np.shape[1], video_np.shape[2]
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
+        out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (w, h))
+        for frame in video_np:
+            out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        out.release()
+        print(f"{Colors.GREEN}✅ Video encoded{Colors.RESET}")
+    except Exception as e:
+        print(f"{Colors.RED}❌ Video encoding failed: {e}{Colors.RESET}")
+        return None, None
+
+    if no_audio:
+        try:
+            if output_path.exists():
+                output_path.unlink()
+            temp_video_path.rename(output_path)
+        except OSError:
+            import shutil
+
+            shutil.move(str(temp_video_path), str(output_path))
+        print(f"{Colors.GREEN}✅ Saved video-only to{Colors.RESET} {output_path}")
+        elapsed = time.time() - start_time
+        print(
+            f"{Colors.BOLD}{Colors.GREEN}🎉 Done! Generated in {elapsed:.1f}s{Colors.RESET}"
+        )
+        print(
+            f"{Colors.BOLD}{Colors.GREEN}✨ Peak memory: {mx.get_peak_memory() / (1024 ** 3):.2f}GB{Colors.RESET}"
+        )
+        return video_np, None
+
     # Decode audio
     print(f"{Colors.BLUE}🔊 Decoding audio...{Colors.RESET}")
     audio_decoder = load_audio_decoder(model_path, use_unified=use_unified)
@@ -1617,29 +1695,8 @@ def generate_video_with_audio(
     if audio_np.ndim == 3:
         audio_np = audio_np[0]  # Remove batch dim
 
-    del audio_decoder, vocoder, vae_decoder
+    del audio_decoder, vocoder
     mx.clear_cache()
-
-    # Save outputs
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Save video (temporary without audio)
-    temp_video_path = output_path.with_suffix(".temp.mp4")
-
-    try:
-        import cv2
-
-        h, w = video_np.shape[1], video_np.shape[2]
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")
-        out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (w, h))
-        for frame in video_np:
-            out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        out.release()
-        print(f"{Colors.GREEN}✅ Video encoded{Colors.RESET}")
-    except Exception as e:
-        print(f"{Colors.RED}❌ Video encoding failed: {e}{Colors.RESET}")
-        return None, None
 
     # Save audio (to temp file or final path)
     keep_audio_file = save_audio_separately or output_audio_path is not None
@@ -1746,6 +1803,11 @@ Examples:
         "--save-audio-separately",
         action="store_true",
         help="Keep the .wav audio file alongside the video (default: off, audio only in mp4)",
+    )
+    parser.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="Video-only output (skip audio VAE/vocoder and mux). Full A/V denoising still runs.",
     )
     parser.add_argument(
         "--model-repo",
@@ -1859,7 +1921,12 @@ Examples:
         image_strength=args.image_strength,
         image_frame_idx=args.image_frame_idx,
         tiling=args.tiling,
+        no_audio=args.no_audio,
     )
+
+
+# Back-compat for integrations that import `generate_av` from this module.
+generate_av = generate_video_with_audio
 
 
 if __name__ == "__main__":

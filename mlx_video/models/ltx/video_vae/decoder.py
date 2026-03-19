@@ -666,12 +666,15 @@ def load_vae_decoder(
     # Read config from safetensors metadata to auto-detect timestep_conditioning
     decoder_blocks = None
     spatial_padding_mode = PaddingModeType.REFLECT
+    timestep_from_embedded: Optional[bool] = None
     embedded_cfg_path = model_path / "embedded_config.json"
     if embedded_cfg_path.exists():
         try:
             with open(embedded_cfg_path, "r") as f:
                 vae_cfg = json.load(f).get("vae", {})
             decoder_blocks = vae_cfg.get("decoder_blocks")
+            if "timestep_conditioning" in vae_cfg:
+                timestep_from_embedded = bool(vae_cfg["timestep_conditioning"])
             padding_name = str(vae_cfg.get("spatial_padding_mode", "reflect")).lower()
             if padding_name == "zeros":
                 spatial_padding_mode = PaddingModeType.ZEROS
@@ -703,6 +706,14 @@ def load_vae_decoder(
                 f"  Could not read config from metadata: {e}, defaulting to timestep_conditioning=False"
             )
             timestep_conditioning = False
+
+    if timestep_from_embedded is not None:
+        print(
+            "  Using "
+            f"timestep_conditioning={timestep_from_embedded} from embedded_config.json "
+            f"(overrides detected {timestep_conditioning})"
+        )
+        timestep_conditioning = timestep_from_embedded
 
     decoder = LTX2VideoDecoder(
         timestep_conditioning=timestep_conditioning,

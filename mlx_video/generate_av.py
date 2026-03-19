@@ -50,7 +50,6 @@ from mlx_video.models.ltx.upsampler import load_upsampler, upsample_latents
 from mlx_video.conditioning import VideoConditionByLatentIndex, apply_conditioning
 from mlx_video.conditioning.latent import LatentState, apply_denoise_mask
 
-
 # Distilled sigma schedules
 DEFAULT_STAGE_1_SIGMAS = [
     1.0,
@@ -1008,6 +1007,14 @@ def generate_video_with_audio(
     """
     start_time = time.time()
 
+    # Force MLX to use GPU on Apple Silicon and print the resolved runtime device.
+    try:
+        mx.set_default_device(mx.gpu)
+    except Exception:
+        # If GPU pinning fails for any reason, keep MLX default behavior.
+        pass
+    print(f"{Colors.DIM}MLX default device: {mx.default_device()}{Colors.RESET}")
+
     # Validate dimensions
     assert height % 64 == 0, f"Height must be divisible by 64, got {height}"
     assert width % 64 == 0, f"Width must be divisible by 64, got {width}"
@@ -1039,6 +1046,22 @@ def generate_video_with_audio(
         )
 
     model_path = get_model_path(model_repo)
+    ltx_23_model = _is_ltx_23_model(model_repo, model_path)
+    use_ltx2_scheduler = ltx_23_model
+    # Keep Unified fast/default behavior unless explicitly on LTX-2.3 model family.
+    enable_advanced_cfg = ltx_23_model
+    effective_cfg_scale = cfg_scale if enable_advanced_cfg else 1.0
+    effective_negative_prompt = (
+        DEFAULT_NEGATIVE_PROMPT if negative_prompt is None else negative_prompt
+    )
+    if not enable_advanced_cfg and cfg_scale > 1.0:
+        print(
+            f"{Colors.DIM}Unified fast path: ignoring advanced CFG (requested {cfg_scale:.2f}) to preserve original performance.{Colors.RESET}"
+        )
+    elif effective_cfg_scale > 1.0:
+        print(
+            f"{Colors.DIM}CFG enabled (scale={effective_cfg_scale:.2f}): denoiser runs conditional + negative passes per step.{Colors.RESET}"
+        )
 
     # Check if using unified MLX model format
     use_unified = is_unified_mlx_model(model_path)
@@ -1075,7 +1098,7 @@ def generate_video_with_audio(
     stage1_sigmas, stage2_sigmas = build_stage_sigma_schedules(
         num_inference_steps,
         stage1_token_count=stage1_token_count,
-        use_ltx2_scheduler=True,
+        use_ltx2_scheduler=use_ltx2_scheduler,
     )
 
     mx.random.seed(seed)
@@ -1150,16 +1173,15 @@ def generate_video_with_audio(
     video_embeddings, audio_embeddings, text_attention_mask = text_encoder(
         prompt, max_length=1024
     )
-    negative_prompt = (
-        DEFAULT_NEGATIVE_PROMPT if negative_prompt is None else negative_prompt
+    cfg_enabled = effective_cfg_scale > 1.0 and bool(
+        str(effective_negative_prompt).strip()
     )
-    cfg_enabled = cfg_scale > 1.0 and bool(str(negative_prompt).strip())
     if cfg_enabled:
         (
             video_embeddings_negative,
             audio_embeddings_negative,
             negative_attention_mask,
-        ) = text_encoder(negative_prompt, max_length=1024)
+        ) = text_encoder(effective_negative_prompt, max_length=1024)
     else:
         video_embeddings_negative = None
         audio_embeddings_negative = None
@@ -1397,12 +1419,11 @@ def generate_video_with_audio(
         verbose=verbose,
         video_state=video_state1,
         stage=1,
-        cfg_scale=cfg_scale,
+        cfg_scale=effective_cfg_scale,
     )
 
     # Upsample video latents
     print(f"{Colors.MAGENTA}🔍 Upsampling video latents 2x...{Colors.RESET}")
-    ltx_23_model = _is_ltx_23_model(model_repo, model_path)
     local_upsampler_filename = (
         "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
         if ltx_23_model
@@ -1511,8 +1532,8 @@ def generate_video_with_audio(
         verbose=verbose,
         video_state=video_state2,
         stage=2,
-        cfg_scale=cfg_scale,
-        use_gradient_estimation=True,
+        cfg_scale=effective_cfg_scale,
+        use_gradient_estimation=ltx_23_model,
         ge_gamma=2.0,
     )
 

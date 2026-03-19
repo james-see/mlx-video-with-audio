@@ -1,4 +1,6 @@
 import math
+import sys
+import threading
 from typing import Optional, Tuple, Union
 
 import mlx.core as mx
@@ -11,23 +13,75 @@ from PIL import Image
 
 
 def get_model_path(model_repo: str):
-    """Get or download model path from local dir or HuggingFace repo."""
+    """Get or download model path from local dir or HuggingFace repo.
+
+    Emits structured stderr lines for GUI bridges:
+    - MODEL:CACHED:<repo> when the snapshot is already local
+    - DOWNLOAD:START:<repo> before a network download
+    - DOWNLOAD:HEARTBEAT:<repo> periodically during long quiet downloads
+    - DOWNLOAD:COMPLETE:<repo> when finished
+    """
     local_path = Path(model_repo).expanduser()
     if local_path.exists() and local_path.is_dir():
         return local_path
 
     try:
-        return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
-    except Exception:
-        print("Downloading model weights...")
-        return Path(
-            snapshot_download(
-                repo_id=model_repo,
-                local_files_only=False,
-                resume_download=True,
-                allow_patterns=["*.safetensors", "*.json"],
-            )
+        path = Path(
+            snapshot_download(repo_id=model_repo, local_files_only=True),
         )
+        print(f"MODEL:CACHED:{model_repo}", file=sys.stderr, flush=True)
+        return path
+    except Exception:
+        print(
+            f"DOWNLOAD:START:{model_repo}",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            "STATUS:Downloading model from Hugging Face (first run can take a long time)...",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        stop_hb = threading.Event()
+
+        def _heartbeat():
+            # huggingface_hub may go quiet for many minutes on huge single files; keep
+            # the subprocess pipe active so host apps do not treat this as a stall.
+            while not stop_hb.wait(120):
+                print(
+                    f"DOWNLOAD:HEARTBEAT:{model_repo}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    "STATUS:Still downloading model — large checkpoints can pause between progress updates.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    "If this hangs for hours, try: hf download "
+                    f"{model_repo}   # then retry generation",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        hb_thread = threading.Thread(target=_heartbeat, name="hf-download-heartbeat")
+        hb_thread.daemon = True
+        hb_thread.start()
+        try:
+            path = Path(
+                snapshot_download(
+                    repo_id=model_repo,
+                    local_files_only=False,
+                    resume_download=True,
+                    allow_patterns=["*.safetensors", "*.json"],
+                )
+            )
+        finally:
+            stop_hb.set()
+        print(f"DOWNLOAD:COMPLETE:{model_repo}", file=sys.stderr, flush=True)
+        return path
 
 
 def apply_quantization(model: nn.Module, weights: mx.array, quantization: dict):

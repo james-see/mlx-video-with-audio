@@ -890,14 +890,22 @@ def load_vocoder(model_path: Path, use_unified: bool = False):
         # Load from unified MLX model (weights already sanitized)
         sanitized = load_unified_weights(model_path, "vocoder.")
         if sanitized:
-            # Distilled split vocoder uses PyTorch layout for ConvTranspose1d upsamplers
-            # while other conv weights are already MLX-compatible.
+            # ConvTranspose1d weight fixup: MLX expects (out_ch, kernel, in_ch).
+            # Different model repos store ups weights in different layouts:
+            #   notapalindrome unified: (out_ch, kernel, in_ch) — already correct
+            #   dgrauet distilled:      (in_ch, out_ch, kernel) — needs transpose(1,2,0)
+            # Detect: if last dim is largest the weight is already MLX layout
+            # (in_ch > out_ch for upsamplers), otherwise it's PyTorch layout.
             fixed = {}
             for key, value in sanitized.items():
                 if value.ndim == 3 and (
                     key.startswith("ups.") or key.startswith("bwe_generator.ups.")
                 ):
-                    value = mx.transpose(value, (1, 2, 0))
+                    d0, d1, d2 = value.shape
+                    if d2 >= d0 and d2 >= d1:
+                        pass  # already (out_ch, kernel, in_ch)
+                    else:
+                        value = mx.transpose(value, (1, 2, 0))
                 fixed[key] = value
             sanitized = fixed
             if isinstance(vocoder, VocoderWithBWE):

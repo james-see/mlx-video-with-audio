@@ -353,7 +353,9 @@ def load_upsampler(
         if (path / "model.safetensors").exists():
             all_weights = mx.load(str(path / "model.safetensors"))
             raw_weights = {
-                k: v for k, v in all_weights.items() if k.startswith("upsampler.")
+                k.removeprefix("upsampler."): v
+                for k, v in all_weights.items()
+                if k.startswith("upsampler.")
             }
             if not raw_weights:
                 raw_weights = None

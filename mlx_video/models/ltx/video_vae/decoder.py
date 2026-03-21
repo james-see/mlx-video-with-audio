@@ -749,8 +749,12 @@ def load_vae_decoder(
     else:
         prefix = ""
         stats_prefix = ""
-        mean_key = "latents_mean"
-        std_key = "latents_std"
+        if "per_channel_statistics.mean" in weights:
+            mean_key = "per_channel_statistics.mean"
+            std_key = "per_channel_statistics.std"
+        else:
+            mean_key = "latents_mean"
+            std_key = "latents_std"
 
     if mean_key in weights:
         decoder.latents_mean = weights[mean_key]

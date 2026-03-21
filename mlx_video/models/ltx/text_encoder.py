@@ -786,6 +786,13 @@ class LTX2TextEncoder(nn.Module):
                         transformer_weights[new_k] = v
                 elif k.startswith("text_embedding_projection."):
                     transformer_weights[k] = v
+                elif k.startswith(
+                    (
+                        "video_embeddings_connector.",
+                        "audio_embeddings_connector.",
+                    )
+                ):
+                    transformer_weights["model.diffusion_model." + k] = v
         else:
             transformer_files = list(model_path.glob("ltx-2-19*.safetensors"))
             transformer_weights = (
@@ -819,9 +826,11 @@ class LTX2TextEncoder(nn.Module):
                     audio_conn_head_dim = embedded_cfg.get(
                         "audio_connector_attention_head_dim", conn_head_dim
                     )
+                    video_conn_dim = conn_heads * conn_head_dim
+                    audio_conn_dim = audio_conn_heads * audio_conn_head_dim
                     if conn_layers != 2 or conn_heads != 30 or conn_gated:
                         self.video_embeddings_connector = Embeddings1DConnector(
-                            dim=self.hidden_dim,
+                            dim=video_conn_dim,
                             num_heads=conn_heads,
                             head_dim=conn_head_dim,
                             num_layers=conn_layers,
@@ -830,7 +839,7 @@ class LTX2TextEncoder(nn.Module):
                             apply_gated_attention=conn_gated,
                         )
                         self.audio_embeddings_connector = Embeddings1DConnector(
-                            dim=self.hidden_dim,
+                            dim=audio_conn_dim,
                             num_heads=audio_conn_heads,
                             head_dim=audio_conn_head_dim,
                             num_layers=conn_layers,

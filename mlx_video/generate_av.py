@@ -184,11 +184,19 @@ def is_unified_mlx_model(model_path: Path) -> bool:
     2. Split-weight: transformer.safetensors + vae_decoder.safetensors + config.json
        with model_type "AudioVideo" (e.g. quantized/distilled repos)
 
-    Neither layout contains ltx-2-19b-distilled.safetensors (HuggingFace format).
+    Neither layout contains native HuggingFace checkpoint files.
     """
     model_path = Path(model_path)
     has_config = (model_path / "config.json").exists()
-    has_hf_format = (model_path / "ltx-2-19b-distilled.safetensors").exists()
+    has_hf_format = any(
+        (model_path / filename).exists()
+        for filename in (
+            "ltx-2-19b-distilled.safetensors",
+            "ltx-2-19b-dev.safetensors",
+            "ltx-2.3-22b-distilled.safetensors",
+            "ltx-2.3-22b-dev.safetensors",
+        )
+    )
     if not has_config or has_hf_format:
         return False
     has_single = (model_path / "model.safetensors").exists()
@@ -1250,7 +1258,26 @@ def generate_video_with_audio(
         sanitized = load_unified_weights(model_path, "transformer.")
     else:
         # Load from HuggingFace format (needs sanitization)
-        raw_weights = mx.load(str(model_path / "ltx-2-19b-distilled.safetensors"))
+        hf_transformer_candidates = (
+            "ltx-2-19b-distilled.safetensors",
+            "ltx-2-19b-dev.safetensors",
+            "ltx-2.3-22b-distilled.safetensors",
+            "ltx-2.3-22b-dev.safetensors",
+        )
+        hf_transformer_path = next(
+            (
+                model_path / filename
+                for filename in hf_transformer_candidates
+                if (model_path / filename).exists()
+            ),
+            None,
+        )
+        if hf_transformer_path is None:
+            raise FileNotFoundError(
+                f"No native LTX checkpoint found in {model_path} "
+                f"(tried: {', '.join(hf_transformer_candidates)})"
+            )
+        raw_weights = mx.load(str(hf_transformer_path))
         sanitized = sanitize_transformer_weights(raw_weights)
         # Convert transformer weights to bfloat16 for memory efficiency
         sanitized = {

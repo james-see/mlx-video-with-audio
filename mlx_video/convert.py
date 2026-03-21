@@ -1,19 +1,62 @@
 import json
-import shutil
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.utils as mx_utils
 from huggingface_hub import snapshot_download
 
 from mlx_video.models.ltx.config import LTXModelConfig, LTXModelType
 from mlx_video.models.ltx.ltx import LTXModel
 
+LTX2_MAIN_FILES = [
+    "ltx-2-19b-distilled.safetensors",
+    "ltx-2-19b-dev.safetensors",
+]
+LTX23_MAIN_FILES = [
+    "ltx-2.3-22b-distilled.safetensors",
+    "ltx-2.3-22b-dev.safetensors",
+]
+MAIN_MODEL_FILES = LTX23_MAIN_FILES + LTX2_MAIN_FILES
+
+
+def detect_ltx_version(model_path: Path, hf_path: Optional[str] = None) -> str:
+    """Detect LTX model family version from path/repo hint.
+
+    Returns:
+        "2.3" for LTX-2.3 style checkpoints, otherwise "2.0".
+    """
+    if hf_path and "2.3" in hf_path.lower():
+        return "2.3"
+    for filename in LTX23_MAIN_FILES:
+        if (model_path / filename).exists():
+            return "2.3"
+    cfg_path = model_path / "config.json"
+    if cfg_path.exists():
+        try:
+            with open(cfg_path, "r") as f:
+                cfg = json.load(f)
+            if str(cfg.get("model_version", "")).startswith("2.3"):
+                return "2.3"
+        except (OSError, json.JSONDecodeError):
+            pass
+    return "2.0"
+
+
+def find_main_weight_file(model_path: Path) -> Optional[Path]:
+    """Return primary distilled/dev checkpoint path when present."""
+    for filename in MAIN_MODEL_FILES:
+        candidate = model_path / filename
+        if candidate.exists():
+            return candidate
+    return None
+
 
 def get_model_path(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
+    allow_patterns: Optional[list[str]] = None,
 ) -> Path:
     """Get local path to model, downloading if necessary.
 
@@ -29,16 +72,18 @@ def get_model_path(
     if model_path.exists():
         return model_path
 
+    patterns = allow_patterns or [
+        "*.safetensors",
+        "*.json",
+        "config.json",
+    ]
+
     # Download from HuggingFace
     model_path = Path(
         snapshot_download(
             repo_id=path_or_hf_repo,
             revision=revision,
-            allow_patterns=[
-                "*.safetensors",
-                "*.json",
-                "config.json",
-            ],
+            allow_patterns=patterns,
         )
     )
 
@@ -61,15 +106,11 @@ def load_safetensors(path: Path) -> Dict[str, mx.array]:
         return mx.load(str(path))
     else:
         # Directory - load only the main model file (not quantized versions)
-        # Priority: distilled > dev (skip fp4/fp8/lora variants)
-        main_files = [
-            path / "ltx-2-19b-distilled.safetensors",
-            path / "ltx-2-19b-dev.safetensors",
-        ]
-        for main_file in main_files:
-            if main_file.exists():
-                print(f"  Loading from {main_file.name}")
-                return mx.load(str(main_file))
+        # Priority: distilled > dev for known LTX2/LTX2.3 names.
+        main_file = find_main_weight_file(path)
+        if main_file is not None:
+            print(f"  Loading from {main_file.name}")
+            return mx.load(str(main_file))
 
         # Fallback: load first non-quantized safetensors file
         safetensor_files = list(path.glob("*.safetensors"))
@@ -92,16 +133,11 @@ def load_transformer_weights(model_path: Path) -> Dict[str, mx.array]:
     Returns:
         Dictionary of transformer weights
     """
-    # Try distilled model first, then dev
-    weight_files = [
-        model_path / "ltx-2-19b-distilled.safetensors",
-        model_path / "ltx-2-19b-dev.safetensors",
-    ]
-
-    for weight_file in weight_files:
-        if weight_file.exists():
-            print(f"Loading transformer weights from {weight_file.name}...")
-            return mx.load(str(weight_file))
+    # Try distilled model first, then dev for known LTX families.
+    weight_file = find_main_weight_file(model_path)
+    if weight_file is not None:
+        print(f"Loading transformer weights from {weight_file.name}...")
+        return mx.load(str(weight_file))
 
     raise FileNotFoundError(f"No transformer weights found in {model_path}")
 
@@ -139,10 +175,7 @@ def load_audio_vae_weights(model_path: Path) -> Dict[str, mx.array]:
     ]
 
     # Also check in main model weights
-    main_paths = [
-        model_path / "ltx-2-19b-distilled.safetensors",
-        model_path / "ltx-2-19b-dev.safetensors",
-    ]
+    main_paths = [model_path / name for name in MAIN_MODEL_FILES]
 
     for audio_path in audio_vae_paths:
         if audio_path.exists():
@@ -178,10 +211,7 @@ def load_vocoder_weights(model_path: Path) -> Dict[str, mx.array]:
     ]
 
     # Also check in main model weights
-    main_paths = [
-        model_path / "ltx-2-19b-distilled.safetensors",
-        model_path / "ltx-2-19b-dev.safetensors",
-    ]
+    main_paths = [model_path / name for name in MAIN_MODEL_FILES]
 
     for vocoder_path in vocoder_paths:
         if vocoder_path.exists():
@@ -512,6 +542,19 @@ def create_model_from_config(config: Dict[str, Any]) -> LTXModel:
         LTXModel instance
     """
     # Map config to LTXModelConfig
+    caption_channels = config.get("caption_channels", 3840)
+    if caption_channels is None:
+        conn_heads = int(config.get("connector_num_attention_heads", 32))
+        conn_head_dim = int(config.get("connector_attention_head_dim", 128))
+        caption_channels = conn_heads * conn_head_dim
+
+    audio_caption_channels = config.get("audio_caption_channels", 3840)
+    if audio_caption_channels is None:
+        audio_conn_heads = int(config.get("audio_connector_num_attention_heads", 32))
+        audio_conn_head_dim = int(config.get("audio_connector_attention_head_dim", 64))
+        audio_caption_channels = audio_conn_heads * audio_conn_head_dim
+
+    apply_gated_attention = bool(config.get("apply_gated_attention", False))
     model_config = LTXModelConfig(
         model_type=LTXModelType.AudioVideo,
         num_attention_heads=config.get("num_attention_heads", 32),
@@ -520,12 +563,21 @@ def create_model_from_config(config: Dict[str, Any]) -> LTXModel:
         out_channels=config.get("out_channels", 128),
         num_layers=config.get("num_layers", 48),
         cross_attention_dim=config.get("cross_attention_dim", 4096),
-        caption_channels=config.get("caption_channels", 3840),
+        caption_channels=caption_channels,
+        caption_projection_first_linear=config.get(
+            "caption_projection_first_linear", True
+        ),
+        caption_projection_second_linear=config.get(
+            "caption_projection_second_linear", True
+        ),
+        adaln_embedding_coefficient=(9 if apply_gated_attention else 6),
+        apply_gated_attention=apply_gated_attention,
         audio_num_attention_heads=config.get("audio_num_attention_heads", 32),
         audio_attention_head_dim=config.get("audio_attention_head_dim", 64),
         audio_in_channels=config.get("audio_in_channels", 128),
         audio_out_channels=config.get("audio_out_channels", 128),
         audio_cross_attention_dim=config.get("audio_cross_attention_dim", 2048),
+        audio_caption_channels=audio_caption_channels,
         positional_embedding_theta=config.get("positional_embedding_theta", 10000.0),
         positional_embedding_max_pos=config.get(
             "positional_embedding_max_pos", [20, 2048, 2048]
@@ -541,6 +593,320 @@ def create_model_from_config(config: Dict[str, Any]) -> LTXModel:
     )
 
     return LTXModel(model_config)
+
+
+def build_output_config(version: str, include_audio: bool) -> Dict[str, Any]:
+    """Create output config.json for unified/split MLX outputs."""
+    config = {
+        "model_type": "AudioVideo" if include_audio else "VideoOnly",
+        "num_attention_heads": 32,
+        "attention_head_dim": 128,
+        "in_channels": 128,
+        "out_channels": 128,
+        "num_layers": 48,
+        "cross_attention_dim": 4096,
+        "caption_channels": 3840,
+        "audio_num_attention_heads": 32,
+        "audio_attention_head_dim": 64,
+        "audio_in_channels": 128,
+        "audio_out_channels": 128,
+        "audio_cross_attention_dim": 2048,
+        "positional_embedding_theta": 10000.0,
+        "positional_embedding_max_pos": [20, 2048, 2048],
+        "audio_positional_embedding_max_pos": [20],
+        "timestep_scale_multiplier": 1000,
+        "av_ca_timestep_scale_multiplier": 1000,
+        "norm_eps": 1e-6,
+        "audio_sample_rate": 24000,
+        "audio_latent_sample_rate": 16000,
+        "audio_hop_length": 160,
+        "audio_latent_channels": 8,
+        "audio_mel_bins": 16,
+    }
+    if version == "2.3":
+        config.update(
+            {
+                "model_version": "2.3.0",
+                "is_v2": True,
+                "caption_channels": None,
+                "apply_gated_attention": True,
+                "cross_attention_adaln": True,
+                "connector_positional_embedding_max_pos": [4096],
+                "connector_rope_type": "SPLIT",
+                "connector_num_attention_heads": 32,
+                "connector_attention_head_dim": 128,
+                "audio_connector_num_attention_heads": 32,
+                "audio_connector_attention_head_dim": 64,
+                "caption_projection_first_linear": False,
+                "caption_projection_second_linear": False,
+            }
+        )
+    return config
+
+
+def build_embedded_config(version: str) -> Dict[str, Any]:
+    """Create embedded_config.json used by runtime for advanced model features."""
+    if version != "2.3":
+        return {}
+    return {
+        "transformer": {
+            "_class_name": "AVTransformer3DModel",
+            "attention_head_dim": 128,
+            "attention_type": "default",
+            "caption_channels": 3840,
+            "cross_attention_dim": 4096,
+            "in_channels": 128,
+            "norm_eps": 1e-6,
+            "num_attention_heads": 32,
+            "num_layers": 48,
+            "out_channels": 128,
+            "audio_num_attention_heads": 32,
+            "audio_attention_head_dim": 64,
+            "audio_out_channels": 128,
+            "audio_cross_attention_dim": 2048,
+            "audio_positional_embedding_max_pos": [20],
+            "use_embeddings_connector": True,
+            "connector_attention_head_dim": 128,
+            "connector_num_attention_heads": 32,
+            "connector_num_layers": 8,
+            "connector_positional_embedding_max_pos": [4096],
+            "connector_num_learnable_registers": 128,
+            "use_middle_indices_grid": True,
+            "apply_gated_attention": True,
+            "connector_apply_gated_attention": True,
+            "caption_projection_first_linear": False,
+            "caption_projection_second_linear": False,
+            "audio_connector_attention_head_dim": 64,
+            "audio_connector_num_attention_heads": 32,
+            "cross_attention_adaln": True,
+            "text_encoder_norm_type": "per_token_rms",
+            "rope_type": "split",
+            "frequencies_precision": "float64",
+            "positional_embedding_theta": 10000.0,
+            "positional_embedding_max_pos": [20, 2048, 2048],
+            "timestep_scale_multiplier": 1000,
+            "av_ca_timestep_scale_multiplier": 1000.0,
+        },
+        "vae": {
+            "_class_name": "CausalVideoAutoencoder",
+            "dims": 3,
+            "in_channels": 3,
+            "out_channels": 3,
+            "latent_channels": 128,
+            "patch_size": 4,
+            "norm_layer": "pixel_norm",
+            "spatial_padding_mode": "zeros",
+            "timestep_conditioning": False,
+            "decoder_blocks": [
+                ["res_x", {"num_layers": 4}],
+                ["compress_space", {"multiplier": 2}],
+                ["res_x", {"num_layers": 6}],
+                ["compress_time", {"multiplier": 2}],
+                ["res_x", {"num_layers": 4}],
+                ["compress_all", {"multiplier": 1}],
+                ["res_x", {"num_layers": 2}],
+                ["compress_all", {"multiplier": 2}],
+                ["res_x", {"num_layers": 2}],
+            ],
+            "encoder_blocks": [
+                ["res_x", {"num_layers": 4}],
+                ["compress_space_res", {"multiplier": 2}],
+                ["res_x", {"num_layers": 6}],
+                ["compress_time_res", {"multiplier": 2}],
+                ["res_x", {"num_layers": 4}],
+                ["compress_all_res", {"multiplier": 2}],
+                ["res_x", {"num_layers": 2}],
+                ["compress_all_res", {"multiplier": 1}],
+                ["res_x", {"num_layers": 2}],
+            ],
+        },
+        "audio_vae": {
+            "model": {
+                "params": {
+                    "ddconfig": {
+                        "double_z": True,
+                        "mel_bins": 64,
+                        "z_channels": 8,
+                        "resolution": 256,
+                        "in_channels": 2,
+                        "out_ch": 2,
+                        "ch": 128,
+                        "ch_mult": [1, 2, 4],
+                        "num_res_blocks": 2,
+                        "dropout": 0.0,
+                        "mid_block_add_attention": False,
+                        "norm_type": "pixel",
+                        "causality_axis": "height",
+                    },
+                    "sampling_rate": 16000,
+                }
+            }
+        },
+        "scheduler": {
+            "_class_name": "RectifiedFlowScheduler",
+            "_diffusers_version": "0.25.1",
+            "num_train_timesteps": 1000,
+            "sampler": "LinearQuadratic",
+        },
+        "vocoder": {
+            "vocoder": {
+                "upsample_initial_channel": 1536,
+                "resblock": "AMP1",
+                "upsample_rates": [5, 2, 2, 2, 2, 2],
+                "resblock_kernel_sizes": [3, 7, 11],
+                "upsample_kernel_sizes": [11, 4, 4, 4, 4, 4],
+                "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+                "stereo": True,
+                "use_tanh_at_final": False,
+                "activation": "snakebeta",
+                "use_bias_at_final": False,
+            },
+            "bwe": {
+                "upsample_initial_channel": 512,
+                "resblock": "AMP1",
+                "upsample_rates": [6, 5, 2, 2, 2],
+                "resblock_kernel_sizes": [3, 7, 11],
+                "upsample_kernel_sizes": [12, 11, 4, 4, 4],
+                "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+                "stereo": True,
+                "use_tanh_at_final": False,
+                "activation": "snakebeta",
+                "use_bias_at_final": False,
+                "apply_final_activation": False,
+                "input_sampling_rate": 16000,
+                "output_sampling_rate": 48000,
+                "hop_length": 80,
+                "n_fft": 512,
+                "win_size": 512,
+                "num_mels": 64,
+            },
+        },
+    }
+
+
+def _quantize_ltx_predicate(path: str, module: nn.Module) -> bool:
+    if not hasattr(module, "to_quantized"):
+        return False
+    patterns = (
+        ".to_q",
+        ".to_k",
+        ".to_v",
+        ".to_out",
+        ".ff.proj_in",
+        ".ff.proj_out",
+        ".audio_ff.proj_in",
+        ".audio_ff.proj_out",
+    )
+    return any(path.endswith(pattern) for pattern in patterns)
+
+
+def _to_component_dict(
+    weights: Dict[str, mx.array], prefix: str
+) -> Dict[str, mx.array]:
+    start = f"{prefix}."
+    return {k[len(start) :]: v for k, v in weights.items() if k.startswith(start)}
+
+
+def _save_split_components(
+    output_path: Path,
+    unified_weights: Dict[str, mx.array],
+    version: str,
+    source_repo: Optional[str] = None,
+    variant: str = "distilled",
+    quantized_transformer: Optional[Dict[str, mx.array]] = None,
+    q_bits: Optional[int] = None,
+    q_group_size: Optional[int] = None,
+) -> None:
+    component_names = []
+    transformer_weights = quantized_transformer or _to_component_dict(
+        unified_weights, "transformer"
+    )
+    mx.save_safetensors(
+        str(output_path / "transformer.safetensors"), transformer_weights
+    )
+    component_names.append("transformer")
+
+    connector_weights = _to_component_dict(unified_weights, "connector")
+    text_proj_weights = _to_component_dict(unified_weights, "text_embedding_projection")
+    if text_proj_weights:
+        connector_weights.update(
+            {f"text_embedding_projection.{k}": v for k, v in text_proj_weights.items()}
+        )
+    if connector_weights:
+        mx.save_safetensors(
+            str(output_path / "connector.safetensors"), connector_weights
+        )
+        component_names.append("connector")
+
+    for component in (
+        "vae_decoder",
+        "vae_encoder",
+        "audio_vae",
+        "vocoder",
+    ):
+        component_weights = _to_component_dict(unified_weights, component)
+        if component_weights:
+            mx.save_safetensors(
+                str(output_path / f"{component}.safetensors"), component_weights
+            )
+            component_names.append(component)
+
+    # Compatibility alias for runtime's unified upsampler lookup.
+    upsampler_weights = _to_component_dict(unified_weights, "upsampler")
+    if upsampler_weights:
+        mx.save_safetensors(
+            str(output_path / "upsampler.safetensors"), upsampler_weights
+        )
+        component_names.append("upsampler")
+    for component in (
+        "spatial_upscaler_x2_v1_1",
+        "spatial_upscaler_x1_5_v1_0",
+        "temporal_upscaler_x2_v1_0",
+    ):
+        component_weights = _to_component_dict(unified_weights, component)
+        if component_weights:
+            mx.save_safetensors(
+                str(output_path / f"{component}.safetensors"), component_weights
+            )
+            component_names.append(component)
+
+    manifest = {
+        "format": "split",
+        "model_version": "2.3.0" if version == "2.3" else "2.0.0",
+        "components": component_names,
+    }
+    if source_repo:
+        manifest["source"] = source_repo
+    manifest["variant"] = variant
+    if q_bits is not None and q_group_size is not None:
+        manifest["quantized"] = True
+        manifest["quantization_bits"] = q_bits
+        manifest["quantization_group_size"] = q_group_size
+        with open(output_path / "quantize_config.json", "w") as f:
+            json.dump(
+                {"quantization": {"bits": q_bits, "group_size": q_group_size}},
+                f,
+                indent=2,
+            )
+    with open(output_path / "split_model.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def quantize_transformer_weights(
+    transformer_weights: Dict[str, mx.array],
+    config: Dict[str, Any],
+    q_bits: int,
+    q_group_size: int,
+) -> Dict[str, mx.array]:
+    model = create_model_from_config(config)
+    model.load_weights(list(transformer_weights.items()), strict=False)
+    nn.quantize(
+        model,
+        bits=q_bits,
+        group_size=q_group_size,
+        class_predicate=_quantize_ltx_predicate,
+    )
+    return dict(mx_utils.tree_flatten(model.parameters()))
 
 
 def convert(
@@ -574,7 +940,22 @@ def convert(
         Path to converted model
     """
     print(f"Loading model from {hf_path}...")
-    model_path = get_model_path(hf_path)
+    repo_hint_23 = "2.3" in hf_path.lower()
+    allow_patterns = (
+        [
+            "ltx-2.3-22b-distilled.safetensors",
+            "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+            "ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors",
+            "ltx-2.3-temporal-upscaler-x2-1.0.safetensors",
+            "*.json",
+            "config.json",
+        ]
+        if repo_hint_23
+        else None
+    )
+    model_path = get_model_path(hf_path, allow_patterns=allow_patterns)
+    model_version = detect_ltx_version(model_path, hf_path)
+    print(f"Detected LTX version: {model_version}")
 
     # Load all raw weights
     print("Loading weights...")
@@ -643,16 +1024,32 @@ def convert(
             connector_count += 1
     print(f"  Added {connector_count} connector weights")
 
-    # 8. Add upsampler weights (enables fully self-contained unified model)
-    upsampler_path = model_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
-    if upsampler_path.exists():
-        print("Processing upsampler weights...")
+    # 8. Add upsampler weights (enables fully self-contained unified/split model)
+    upscaler_specs = (
+        [
+            ("upsampler", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+            ("spatial_upscaler_x2_v1_1", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+            (
+                "spatial_upscaler_x1_5_v1_0",
+                "ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors",
+            ),
+            (
+                "temporal_upscaler_x2_v1_0",
+                "ltx-2.3-temporal-upscaler-x2-1.0.safetensors",
+            ),
+        ]
+        if model_version == "2.3"
+        else [("upsampler", "ltx-2-spatial-upscaler-x2-1.0.safetensors")]
+    )
+    for prefix, filename in upscaler_specs:
+        upsampler_path = model_path / filename
+        if not upsampler_path.exists():
+            continue
+        print(f"Processing {prefix} weights from {filename}...")
         upsampler_weights = mx.load(str(upsampler_path))
         for k, v in upsampler_weights.items():
-            unified_weights[f"upsampler.{k}"] = v
-        print(f"  Added {len(upsampler_weights)} upsampler weights")
-    else:
-        print("  Skipping upsampler (not found, will fallback to download at runtime)")
+            unified_weights[f"{prefix}.{k}"] = v
+        print(f"  Added {len(upsampler_weights)} {prefix} weights")
 
     print(f"Total unified weights: {len(unified_weights)}")
 
@@ -678,46 +1075,35 @@ def convert(
     output_path = Path(mlx_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Save weights
-    print(f"Saving weights to {output_path}...")
-    save_weights(output_path, unified_weights)
-
-    # Build and save config with audio parameters
-    config = {
-        "model_type": "AudioVideo" if include_audio else "VideoOnly",
-        # Transformer config
-        "num_attention_heads": 32,
-        "attention_head_dim": 128,
-        "in_channels": 128,
-        "out_channels": 128,
-        "num_layers": 48,
-        "cross_attention_dim": 4096,
-        "caption_channels": 3840,
-        # Audio config
-        "audio_num_attention_heads": 32,
-        "audio_attention_head_dim": 64,
-        "audio_in_channels": 128,
-        "audio_out_channels": 128,
-        "audio_cross_attention_dim": 2048,
-        # Positional embedding config
-        "positional_embedding_theta": 10000.0,
-        "positional_embedding_max_pos": [20, 2048, 2048],
-        "audio_positional_embedding_max_pos": [20],
-        # Timestep config
-        "timestep_scale_multiplier": 1000,
-        "av_ca_timestep_scale_multiplier": 1000,
-        "norm_eps": 1e-6,
-        # Audio constants
-        "audio_sample_rate": 24000,
-        "audio_latent_sample_rate": 16000,
-        "audio_hop_length": 160,
-        "audio_latent_channels": 8,
-        "audio_mel_bins": 16,
-    }
+    config = build_output_config(version=model_version, include_audio=include_audio)
 
     config_out_path = output_path / "config.json"
     with open(config_out_path, "w") as f:
         json.dump(config, f, indent=2)
+
+    embedded_config = build_embedded_config(model_version)
+    if embedded_config:
+        with open(output_path / "embedded_config.json", "w") as f:
+            json.dump(embedded_config, f, indent=2)
+
+    # Save weights in requested format
+    print(f"Saving weights to {output_path}...")
+    if quantize:
+        transformer_raw = _to_component_dict(unified_weights, "transformer")
+        quantized_transformer = quantize_transformer_weights(
+            transformer_raw, config, q_bits=q_bits, q_group_size=q_group_size
+        )
+        _save_split_components(
+            output_path=output_path,
+            unified_weights=unified_weights,
+            version=model_version,
+            source_repo=hf_path,
+            quantized_transformer=quantized_transformer,
+            q_bits=q_bits,
+            q_group_size=q_group_size,
+        )
+    else:
+        save_weights(output_path, unified_weights)
 
     print(f"Model converted successfully to {output_path}")
     print(f"  - Transformer: {len(transformer_weights)} weights")
@@ -783,25 +1169,25 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Convert LTX-2 model to MLX format with audio support",
+        description="Convert LTX-2/LTX-2.3 model to MLX format with audio support",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Convert with audio support (default)
-  python -m mlx_video.convert --hf-path Lightricks/LTX-2 --mlx-path mlx_model
+  python -m mlx_video.convert --hf-path Lightricks/LTX-2.3 --mlx-path mlx_model
 
   # Convert video-only (no audio)
-  python -m mlx_video.convert --hf-path Lightricks/LTX-2 --mlx-path mlx_model --no-audio
+  python -m mlx_video.convert --hf-path Lightricks/LTX-2.3 --mlx-path mlx_model --no-audio
 
-  # Convert with bfloat16 precision
-  python -m mlx_video.convert --hf-path Lightricks/LTX-2 --mlx-path mlx_model --dtype bfloat16
+  # Convert quantized Q4 split model
+  python -m mlx_video.convert --hf-path Lightricks/LTX-2.3 --mlx-path mlx_model_q4 --quantize --q-bits 4
         """,
     )
     parser.add_argument(
         "--hf-path",
         type=str,
-        default="Lightricks/LTX-2",
-        help="HuggingFace model path or repo ID (default: Lightricks/LTX-2)",
+        default="Lightricks/LTX-2.3",
+        help="HuggingFace model path or repo ID (default: Lightricks/LTX-2.3)",
     )
     parser.add_argument(
         "--mlx-path",
@@ -832,6 +1218,12 @@ Examples:
         default=4,
         help="Quantization bits (default: 4)",
     )
+    parser.add_argument(
+        "--q-group-size",
+        type=int,
+        default=64,
+        help="Quantization group size (default: 64)",
+    )
 
     args = parser.parse_args()
 
@@ -841,6 +1233,7 @@ Examples:
         dtype=args.dtype,
         quantize=args.quantize,
         q_bits=args.q_bits,
+        q_group_size=args.q_group_size,
         include_audio=not args.no_audio,
     )
 

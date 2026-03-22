@@ -102,7 +102,9 @@ def load_vae_encoder(model_path: str, use_unified: bool = False) -> VideoEncoder
                 )
     except Exception as e:
         print(f"  Could not read config from metadata: {e}")
-        # Use default config
+
+    if not encoder_blocks:
+        # Fallback when metadata is missing/empty or unreadable
         encoder_blocks = [
             ("res_x", {"num_layers": 4}),
             ("compress_space_res", {"multiplier": 2}),

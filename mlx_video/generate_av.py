@@ -1082,8 +1082,19 @@ def generate_video_with_audio(
             f"{Colors.DIM}Image: {image} (strength={image_strength}, frame={image_frame_idx}){Colors.RESET}"
         )
 
+    from mlx_video.version import __version__ as mlx_video_version
+
+    print(
+        f"{Colors.DIM}mlx-video-with-audio v{mlx_video_version}{Colors.RESET}"
+    )
+    print(f"MLX_VIDEO_VERSION:{mlx_video_version}", file=sys.stderr, flush=True)
+
     model_path = get_model_path(model_repo)
     ltx_23_model = _is_ltx_23_model(model_repo, model_path)
+    if ltx_23_model:
+        print(
+            f"{Colors.DIM}Detected LTX-2.3 model family (gated attention, ltx2 scheduler, advanced CFG){Colors.RESET}"
+        )
     use_ltx2_scheduler = ltx_23_model
     # Keep Unified fast/default behavior unless explicitly on LTX-2.3 model family.
     enable_advanced_cfg = ltx_23_model

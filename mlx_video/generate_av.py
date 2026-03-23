@@ -80,6 +80,24 @@ DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
+def adain_filter_latent(
+    latents: mx.array, reference_latents: mx.array, factor: float = 1.0
+) -> mx.array:
+    """Adaptive Instance Normalization: align per-channel statistics of latents
+    to match those of reference_latents. Matches upstream Lightricks pipeline
+    which applies this after spatial upsampling between stage-1 and stage-2."""
+    spatial_axes = tuple(range(2, latents.ndim))
+    # Per-batch, per-channel mean/std  →  keepdims for broadcasting
+    i_mean = mx.mean(latents, axis=spatial_axes, keepdims=True)
+    i_var = mx.var(latents, axis=spatial_axes, keepdims=True)
+    i_std = mx.sqrt(i_var + 1e-8)
+    r_mean = mx.mean(reference_latents, axis=spatial_axes, keepdims=True)
+    r_var = mx.var(reference_latents, axis=spatial_axes, keepdims=True)
+    r_std = mx.sqrt(r_var + 1e-8)
+    normalized = (latents - i_mean) / i_std * r_std + r_mean
+    return latents + mx.array(factor, dtype=latents.dtype) * (normalized - latents)
+
+
 def linear_quadratic_schedule(
     num_steps: int, threshold_noise: float = 0.025, linear_steps: Optional[int] = None
 ) -> list[float]:
@@ -1084,31 +1102,33 @@ def generate_video_with_audio(
 
     from mlx_video.version import __version__ as mlx_video_version
 
-    print(
-        f"{Colors.DIM}mlx-video-with-audio v{mlx_video_version}{Colors.RESET}"
-    )
+    print(f"{Colors.DIM}mlx-video-with-audio v{mlx_video_version}{Colors.RESET}")
     print(f"MLX_VIDEO_VERSION:{mlx_video_version}", file=sys.stderr, flush=True)
 
     model_path = get_model_path(model_repo)
     ltx_23_model = _is_ltx_23_model(model_repo, model_path)
     if ltx_23_model:
         print(
-            f"{Colors.DIM}Detected LTX-2.3 model family (gated attention, ltx2 scheduler, advanced CFG){Colors.RESET}"
+            f"{Colors.DIM}Detected LTX-2.3 distilled model family (gated attention, LinearQuadratic scheduler){Colors.RESET}"
         )
-    use_ltx2_scheduler = ltx_23_model
-    # Keep Unified fast/default behavior unless explicitly on LTX-2.3 model family.
-    enable_advanced_cfg = ltx_23_model
-    effective_cfg_scale = cfg_scale if enable_advanced_cfg else 1.0
+
+    # LTX-2.3 is a distilled model — guidance is baked in during training.
+    # Using CFG on top of distilled guidance causes severe double-guidance artifacts.
+    # The upstream Lightricks config uses guidance_scale=1 for distilled models.
+    # LTX-2.3 embedded config specifies sampler=LinearQuadratic, not SD3-style shifting.
+    use_ltx2_scheduler = False
+    enable_advanced_cfg = False
+    effective_cfg_scale = 1.0
     effective_negative_prompt = (
         DEFAULT_NEGATIVE_PROMPT if negative_prompt is None else negative_prompt
     )
-    if not enable_advanced_cfg and cfg_scale > 1.0:
+    if ltx_23_model and cfg_scale > 1.0:
+        print(
+            f"{Colors.DIM}Distilled model: ignoring CFG scale {cfg_scale:.2f} (guidance is baked in; upstream uses scale=1.0).{Colors.RESET}"
+        )
+    elif not ltx_23_model and cfg_scale > 1.0:
         print(
             f"{Colors.DIM}Unified fast path: ignoring advanced CFG (requested {cfg_scale:.2f}) to preserve original performance.{Colors.RESET}"
-        )
-    elif effective_cfg_scale > 1.0:
-        print(
-            f"{Colors.DIM}CFG enabled (scale={effective_cfg_scale:.2f}): denoiser runs conditional + negative passes per step.{Colors.RESET}"
         )
 
     # Check if using unified MLX model format
@@ -1536,12 +1556,14 @@ def generate_video_with_audio(
         use_unified=use_unified and (vae_model_path == model_path),
     )
 
+    pre_upsample_latents = video_latents
     video_latents = upsample_latents(
         video_latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std
     )
+    video_latents = adain_filter_latent(video_latents, pre_upsample_latents, factor=1.0)
     mx.eval(video_latents)
 
-    del upsampler
+    del upsampler, pre_upsample_latents
     mx.clear_cache()
 
     # Stage 2: Refine at full resolution

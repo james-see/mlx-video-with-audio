@@ -1,0 +1,14 @@
+---
+description: PyPI publishing happens automatically via GitHub Actions on tag push
+alwaysApply: true
+---
+
+# PyPI Publishing
+
+PyPI releases are published **automatically** by a GitHub Action triggered on git tag push. Do NOT manually run `twine upload` or `python -m build && twine upload`.
+
+To release a new version:
+1. Bump `mlx_video/version.py`
+2. Commit and tag: `git tag v<version>`
+3. Push with tags: `git push origin main --tags`
+4. The GitHub Action handles build + publish to PyPI

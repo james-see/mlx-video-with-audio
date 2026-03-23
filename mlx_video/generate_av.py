@@ -1109,14 +1109,12 @@ def generate_video_with_audio(
     ltx_23_model = _is_ltx_23_model(model_repo, model_path)
     if ltx_23_model:
         print(
-            f"{Colors.DIM}Detected LTX-2.3 distilled model family (gated attention, LinearQuadratic scheduler){Colors.RESET}"
+            f"{Colors.DIM}Detected LTX-2.3 distilled model family (gated attention){Colors.RESET}"
         )
 
-    # LTX-2.3 is a distilled model — guidance is baked in during training.
-    # Using CFG on top of distilled guidance causes severe double-guidance artifacts.
-    # The upstream Lightricks config uses guidance_scale=1 for distilled models.
-    # LTX-2.3 embedded config specifies sampler=LinearQuadratic, not SD3-style shifting.
-    use_ltx2_scheduler = False
+    # LTX-2.3 uses the ltx2 scheduler (token-dependent shifting) and disables CFG.
+    # Distilled models have guidance baked in — CFG on top causes double-guidance artifacts.
+    use_ltx2_scheduler = ltx_23_model
     enable_advanced_cfg = False
     effective_cfg_scale = 1.0
     effective_negative_prompt = (
@@ -1124,7 +1122,7 @@ def generate_video_with_audio(
     )
     if ltx_23_model and cfg_scale > 1.0:
         print(
-            f"{Colors.DIM}Distilled model: ignoring CFG scale {cfg_scale:.2f} (guidance is baked in; upstream uses scale=1.0).{Colors.RESET}"
+            f"{Colors.DIM}Distilled model: ignoring CFG scale {cfg_scale:.2f} (guidance is baked in).{Colors.RESET}"
         )
     elif not ltx_23_model and cfg_scale > 1.0:
         print(
@@ -1556,14 +1554,12 @@ def generate_video_with_audio(
         use_unified=use_unified and (vae_model_path == model_path),
     )
 
-    pre_upsample_latents = video_latents
     video_latents = upsample_latents(
         video_latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std
     )
-    video_latents = adain_filter_latent(video_latents, pre_upsample_latents, factor=1.0)
     mx.eval(video_latents)
 
-    del upsampler, pre_upsample_latents
+    del upsampler
     mx.clear_cache()
 
     # Stage 2: Refine at full resolution
@@ -1635,7 +1631,7 @@ def generate_video_with_audio(
         video_state=video_state2,
         stage=2,
         cfg_scale=effective_cfg_scale,
-        use_gradient_estimation=ltx_23_model,
+        use_gradient_estimation=False,
         ge_gamma=2.0,
         use_legacy_euler=legacy_unified_sampler,
     )

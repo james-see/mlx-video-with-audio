@@ -57,54 +57,78 @@ def load_vae_encoder(model_path: str, use_unified: bool = False) -> VideoEncoder
 
     print(f"Loading VAE encoder from {weights_path}...")
 
-    # Read config from safetensors metadata
+    # Read config from embedded_config.json first (2.3 models), then safetensors metadata
     encoder_blocks = []
     norm_layer = NormLayerType.PIXEL_NORM
     latent_log_var = LogVarianceType.UNIFORM
     patch_size = 4
+    spatial_padding_mode = PaddingModeType.ZEROS
 
-    try:
-        with safe_open(str(weights_path), framework="numpy") as f:
-            metadata = f.metadata()
-            if metadata and "config" in metadata:
-                configs = json.loads(metadata["config"])
-                vae_config = configs.get("vae", {})
-
-                # Parse encoder blocks
-                raw_blocks = vae_config.get("encoder_blocks", [])
-                for block in raw_blocks:
-                    if isinstance(block, list) and len(block) == 2:
-                        name, params = block
-                        encoder_blocks.append((name, params))
-
-                # Parse other config
-                norm_str = vae_config.get("norm_layer", "pixel_norm")
-                norm_layer = (
-                    NormLayerType.PIXEL_NORM
-                    if norm_str == "pixel_norm"
-                    else NormLayerType.GROUP_NORM
-                )
-
-                var_str = vae_config.get("latent_log_var", "uniform")
-                if var_str == "uniform":
-                    latent_log_var = LogVarianceType.UNIFORM
-                elif var_str == "per_channel":
-                    latent_log_var = LogVarianceType.PER_CHANNEL
-                elif var_str == "constant":
-                    latent_log_var = LogVarianceType.CONSTANT
-                else:
-                    latent_log_var = LogVarianceType.NONE
-
-                patch_size = vae_config.get("patch_size", 4)
-
+    cfg_dir = model_path.parent if model_path.is_file() else model_path
+    embedded_cfg_path = cfg_dir / "embedded_config.json"
+    if embedded_cfg_path.exists():
+        try:
+            with open(embedded_cfg_path, "r") as f:
+                vae_cfg = json.load(f).get("vae", {})
+            raw_blocks = vae_cfg.get("encoder_blocks", [])
+            for block in raw_blocks:
+                if isinstance(block, (list, tuple)) and len(block) == 2:
+                    encoder_blocks.append((block[0], block[1]))
+            patch_size = vae_cfg.get("patch_size", patch_size)
+            padding_name = str(vae_cfg.get("spatial_padding_mode", "zeros")).lower()
+            if padding_name == "zeros":
+                spatial_padding_mode = PaddingModeType.ZEROS
+            elif padding_name == "replicate":
+                spatial_padding_mode = PaddingModeType.REPLICATE
+            elif padding_name == "reflect":
+                spatial_padding_mode = PaddingModeType.REFLECT
+            if encoder_blocks:
                 print(
-                    f"  Loaded config: {len(encoder_blocks)} encoder blocks, norm={norm_str}, patch_size={patch_size}"
+                    f"  Loaded encoder config from embedded_config.json: {len(encoder_blocks)} blocks, patch_size={patch_size}"
                 )
-    except Exception as e:
-        print(f"  Could not read config from metadata: {e}")
+        except (json.JSONDecodeError, OSError):
+            pass
 
     if not encoder_blocks:
-        # Fallback when metadata is missing/empty or unreadable
+        try:
+            with safe_open(str(weights_path), framework="numpy") as f:
+                metadata = f.metadata()
+                if metadata and "config" in metadata:
+                    configs = json.loads(metadata["config"])
+                    vae_config = configs.get("vae", {})
+
+                    raw_blocks = vae_config.get("encoder_blocks", [])
+                    for block in raw_blocks:
+                        if isinstance(block, list) and len(block) == 2:
+                            name, params = block
+                            encoder_blocks.append((name, params))
+
+                    norm_str = vae_config.get("norm_layer", "pixel_norm")
+                    norm_layer = (
+                        NormLayerType.PIXEL_NORM
+                        if norm_str == "pixel_norm"
+                        else NormLayerType.GROUP_NORM
+                    )
+
+                    var_str = vae_config.get("latent_log_var", "uniform")
+                    if var_str == "uniform":
+                        latent_log_var = LogVarianceType.UNIFORM
+                    elif var_str == "per_channel":
+                        latent_log_var = LogVarianceType.PER_CHANNEL
+                    elif var_str == "constant":
+                        latent_log_var = LogVarianceType.CONSTANT
+                    else:
+                        latent_log_var = LogVarianceType.NONE
+
+                    patch_size = vae_config.get("patch_size", 4)
+
+                    print(
+                        f"  Loaded config from metadata: {len(encoder_blocks)} encoder blocks, norm={norm_str}, patch_size={patch_size}"
+                    )
+        except Exception as e:
+            print(f"  Could not read config from metadata: {e}")
+
+    if not encoder_blocks:
         encoder_blocks = [
             ("res_x", {"num_layers": 4}),
             ("compress_space_res", {"multiplier": 2}),
@@ -127,7 +151,7 @@ def load_vae_encoder(model_path: str, use_unified: bool = False) -> VideoEncoder
         patch_size=patch_size,
         norm_layer=norm_layer,
         latent_log_var=latent_log_var,
-        encoder_spatial_padding_mode=PaddingModeType.ZEROS,
+        encoder_spatial_padding_mode=spatial_padding_mode,
     )
 
     # Load weights

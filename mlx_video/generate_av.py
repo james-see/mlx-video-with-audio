@@ -1030,6 +1030,8 @@ def generate_video_with_audio(
     image: Optional[str] = None,
     image_strength: float = 1.0,
     image_frame_idx: int = 0,
+    last_frame_image: Optional[str] = None,
+    last_frame_strength: float = 1.0,
     tiling: str = "auto",
     num_inference_steps: int = 30,
     no_audio: bool = False,
@@ -1056,6 +1058,8 @@ def generate_video_with_audio(
         image: Path to conditioning image for I2V
         image_strength: Conditioning strength (1.0 = full denoise)
         image_frame_idx: Frame index to condition (0 = first frame)
+        last_frame_image: Path to conditioning image for last frame
+        last_frame_strength: Last-frame conditioning strength (1.0 = full denoise)
         tiling: Tiling mode for VAE decoding (auto/none/default/aggressive/conservative/spatial/temporal)
         num_inference_steps: Total denoising steps across both stages
         no_audio: If True, skip audio decode/mux (video-only MP4). Full A/V denoising still runs.
@@ -1084,7 +1088,7 @@ def generate_video_with_audio(
     # Calculate audio frames
     audio_frames = compute_audio_frames(num_frames, fps)
 
-    is_i2v = image is not None
+    is_i2v = image is not None or last_frame_image is not None
     mode_str = "I2V+Audio" if is_i2v else "T2V+Audio"
     print(
         f"{Colors.BOLD}{Colors.CYAN}🎬 [{mode_str}] Generating {width}x{height} video with {num_frames} frames + audio{Colors.RESET}"
@@ -1095,9 +1099,13 @@ def generate_video_with_audio(
     print(
         f"{Colors.DIM}Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}{Colors.RESET}"
     )
-    if is_i2v:
+    if image is not None:
         print(
             f"{Colors.DIM}Image: {image} (strength={image_strength}, frame={image_frame_idx}){Colors.RESET}"
+        )
+    if last_frame_image is not None:
+        print(
+            f"{Colors.DIM}Last frame: {last_frame_image} (strength={last_frame_strength}){Colors.RESET}"
         )
 
     from mlx_video.version import __version__ as mlx_video_version
@@ -1410,9 +1418,11 @@ def generate_video_with_audio(
     transformer.load_weights(list(sanitized.items()), strict=False)
     mx.eval(transformer.parameters())
 
-    # Load VAE encoder and encode image for I2V conditioning
+    # Load VAE encoder and encode image(s) for I2V conditioning
     stage1_image_latent = None
     stage2_image_latent = None
+    stage1_last_frame_latent = None
+    stage2_last_frame_latent = None
     if is_i2v:
         print(
             f"{Colors.BLUE}🖼️  Loading VAE encoder and encoding image...{Colors.RESET}"
@@ -1427,23 +1437,20 @@ def generate_video_with_audio(
         )
         mx.eval(vae_encoder.parameters())
 
-        # Load and prepare image for stage 1 (half resolution)
-        input_image = load_image(
-            image, height=height // 2, width=width // 2, dtype=model_dtype
-        )
-        stage1_image_tensor = prepare_image_for_encoding(
-            input_image, height // 2, width // 2, dtype=model_dtype
-        )
-        stage1_image_latent = vae_encoder(stage1_image_tensor)
-        mx.eval(stage1_image_latent)
+        def _encode_image(img_path, h, w):
+            img = load_image(img_path, height=h, width=w, dtype=model_dtype)
+            tensor = prepare_image_for_encoding(img, h, w, dtype=model_dtype)
+            latent = vae_encoder(tensor)
+            mx.eval(latent)
+            return latent
 
-        # Load and prepare image for stage 2 (full resolution)
-        input_image = load_image(image, height=height, width=width, dtype=model_dtype)
-        stage2_image_tensor = prepare_image_for_encoding(
-            input_image, height, width, dtype=model_dtype
-        )
-        stage2_image_latent = vae_encoder(stage2_image_tensor)
-        mx.eval(stage2_image_latent)
+        if image is not None:
+            stage1_image_latent = _encode_image(image, height // 2, width // 2)
+            stage2_image_latent = _encode_image(image, height, width)
+
+        if last_frame_image is not None:
+            stage1_last_frame_latent = _encode_image(last_frame_image, height // 2, width // 2)
+            stage2_last_frame_latent = _encode_image(last_frame_image, height, width)
 
         del vae_encoder
         mx.clear_cache()
@@ -1465,19 +1472,27 @@ def generate_video_with_audio(
     # Apply I2V conditioning for stage 1 if provided
     video_state1 = None
     video_latent_shape = (1, 128, latent_frames, stage1_h, stage1_w)
-    if is_i2v and stage1_image_latent is not None:
+    stage1_conditionings = []
+    if stage1_image_latent is not None:
+        stage1_conditionings.append(VideoConditionByLatentIndex(
+            latent=stage1_image_latent,
+            frame_idx=image_frame_idx,
+            strength=image_strength,
+        ))
+    if stage1_last_frame_latent is not None:
+        stage1_conditionings.append(VideoConditionByLatentIndex(
+            latent=stage1_last_frame_latent,
+            frame_idx=latent_frames - 1,
+            strength=last_frame_strength,
+        ))
+    if stage1_conditionings:
         # PyTorch flow: create zeros -> apply conditioning -> apply noiser
         video_state1 = LatentState(
             latent=mx.zeros(video_latent_shape, dtype=model_dtype),
             clean_latent=mx.zeros(video_latent_shape, dtype=model_dtype),
             denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
         )
-        conditioning = VideoConditionByLatentIndex(
-            latent=stage1_image_latent,
-            frame_idx=image_frame_idx,
-            strength=image_strength,
-        )
-        video_state1 = apply_conditioning(video_state1, [conditioning])
+        video_state1 = apply_conditioning(video_state1, stage1_conditionings)
 
         # Apply noiser: latent = noise * (mask * noise_scale) + latent * (1 - mask * noise_scale)
         noise = mx.random.normal(video_latent_shape).astype(model_dtype)
@@ -1574,19 +1589,27 @@ def generate_video_with_audio(
 
     # Apply I2V conditioning for stage 2 if provided
     video_state2 = None
-    if is_i2v and stage2_image_latent is not None:
+    stage2_conditionings = []
+    if stage2_image_latent is not None:
+        stage2_conditionings.append(VideoConditionByLatentIndex(
+            latent=stage2_image_latent,
+            frame_idx=image_frame_idx,
+            strength=image_strength,
+        ))
+    if stage2_last_frame_latent is not None:
+        stage2_conditionings.append(VideoConditionByLatentIndex(
+            latent=stage2_last_frame_latent,
+            frame_idx=latent_frames - 1,
+            strength=last_frame_strength,
+        ))
+    if stage2_conditionings:
         # PyTorch flow: start with upscaled latent -> apply conditioning -> apply noiser
         video_state2 = LatentState(
             latent=video_latents,  # Start with upscaled latent
             clean_latent=mx.zeros_like(video_latents),
             denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
         )
-        conditioning = VideoConditionByLatentIndex(
-            latent=stage2_image_latent,
-            frame_idx=image_frame_idx,
-            strength=image_strength,
-        )
-        video_state2 = apply_conditioning(video_state2, [conditioning])
+        video_state2 = apply_conditioning(video_state2, stage2_conditionings)
 
         # Apply noiser: conditioned frames (mask=0) keep image latent, unconditioned get partial noise
         video_noise = mx.random.normal(video_latents.shape).astype(model_dtype)
@@ -1942,6 +1965,18 @@ Examples:
         help="Frame index to condition for I2V (0 = first frame, default: 0)",
     )
     parser.add_argument(
+        "--last-frame-image",
+        type=str,
+        default=None,
+        help="Path to conditioning image for last frame",
+    )
+    parser.add_argument(
+        "--last-frame-strength",
+        type=float,
+        default=1.0,
+        help="Last-frame conditioning strength (1.0 = full denoise, 0.0 = keep original, default: 1.0)",
+    )
+    parser.add_argument(
         "--tiling",
         type=str,
         default="auto",
@@ -1984,6 +2019,8 @@ Examples:
         image=args.image,
         image_strength=args.image_strength,
         image_frame_idx=args.image_frame_idx,
+        last_frame_image=args.last_frame_image,
+        last_frame_strength=args.last_frame_strength,
         tiling=args.tiling,
         no_audio=args.no_audio,
     )

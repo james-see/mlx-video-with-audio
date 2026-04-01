@@ -1032,11 +1032,26 @@ def generate_video_with_audio(
     image_frame_idx: int = 0,
     last_frame_image: Optional[str] = None,
     last_frame_strength: float = 1.0,
+    keyframes: Optional[list] = None,
     tiling: str = "auto",
     num_inference_steps: int = 30,
     no_audio: bool = False,
 ):
-    """Generate video with synchronized audio from text prompt, optionally conditioned on an image.
+    """Generate video with synchronized audio from text prompt, optionally conditioned on image(s).
+
+    Image conditioning can be specified in two ways (mutually exclusive):
+
+    1. ``image``/``last_frame_image`` parameters for first/last frame conditioning.
+    2. ``keyframes`` list for conditioning at arbitrary timeline positions::
+
+           keyframes=[
+               {"image": "a.png", "position": 0.0},
+               {"image": "b.png", "position": 0.5},
+               {"image": "c.png", "position": 1.0, "strength": 0.8},
+           ]
+
+       Each entry must have ``image`` (path) and ``position`` (0.0-1.0).
+       ``strength`` defaults to 1.0.
 
     Args:
         model_repo: Model repository ID
@@ -1060,10 +1075,37 @@ def generate_video_with_audio(
         image_frame_idx: Frame index to condition (0 = first frame)
         last_frame_image: Path to conditioning image for last frame
         last_frame_strength: Last-frame conditioning strength (1.0 = full denoise)
+        keyframes: List of keyframe dicts with 'image', 'position' (0.0-1.0), and optional 'strength'
         tiling: Tiling mode for VAE decoding (auto/none/default/aggressive/conservative/spatial/temporal)
         num_inference_steps: Total denoising steps across both stages
         no_audio: If True, skip audio decode/mux (video-only MP4). Full A/V denoising still runs.
     """
+    # Normalize conditioning inputs into a unified list of (image, frame_idx, strength).
+    if keyframes is not None:
+        if image is not None or last_frame_image is not None:
+            raise ValueError(
+                "Cannot use 'keyframes' together with 'image' or 'last_frame_image'. "
+                "Use one or the other."
+            )
+        latent_frames = 1 + (num_frames - 1) // 8
+        _conditioning_inputs = []
+        for kf in keyframes:
+            img = kf["image"] if isinstance(kf, dict) else kf[0]
+            pos = kf["position"] if isinstance(kf, dict) else kf[1]
+            strength = kf.get("strength", 1.0) if isinstance(kf, dict) else (kf[2] if len(kf) > 2 else 1.0)
+            fidx = round(pos * (latent_frames - 1))
+            _conditioning_inputs.append((img, fidx, strength))
+    else:
+        # Legacy path: build list from image / last_frame_image params
+        _conditioning_inputs = []
+        if image is not None:
+            _conditioning_inputs.append((image, image_frame_idx, image_strength))
+        if last_frame_image is not None:
+            latent_frames = 1 + (num_frames - 1) // 8
+            _conditioning_inputs.append((last_frame_image, latent_frames - 1, last_frame_strength))
+
+    is_i2v = len(_conditioning_inputs) > 0
+
     start_time = time.time()
 
     # Force MLX to use GPU on Apple Silicon and print the resolved runtime device.
@@ -1088,7 +1130,6 @@ def generate_video_with_audio(
     # Calculate audio frames
     audio_frames = compute_audio_frames(num_frames, fps)
 
-    is_i2v = image is not None or last_frame_image is not None
     mode_str = "I2V+Audio" if is_i2v else "T2V+Audio"
     print(
         f"{Colors.BOLD}{Colors.CYAN}🎬 [{mode_str}] Generating {width}x{height} video with {num_frames} frames + audio{Colors.RESET}"
@@ -1099,13 +1140,9 @@ def generate_video_with_audio(
     print(
         f"{Colors.DIM}Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}{Colors.RESET}"
     )
-    if image is not None:
+    for _ci_img, _ci_idx, _ci_str in _conditioning_inputs:
         print(
-            f"{Colors.DIM}Image: {image} (strength={image_strength}, frame={image_frame_idx}){Colors.RESET}"
-        )
-    if last_frame_image is not None:
-        print(
-            f"{Colors.DIM}Last frame: {last_frame_image} (strength={last_frame_strength}){Colors.RESET}"
+            f"{Colors.DIM}Keyframe: {_ci_img} (frame={_ci_idx}, strength={_ci_str}){Colors.RESET}"
         )
 
     from mlx_video.version import __version__ as mlx_video_version
@@ -1418,14 +1455,12 @@ def generate_video_with_audio(
     transformer.load_weights(list(sanitized.items()), strict=False)
     mx.eval(transformer.parameters())
 
-    # Load VAE encoder and encode image(s) for I2V conditioning
-    stage1_image_latent = None
-    stage2_image_latent = None
-    stage1_last_frame_latent = None
-    stage2_last_frame_latent = None
+    # Load VAE encoder and encode conditioning image(s)
+    # Each entry: (frame_idx, strength, stage1_latent, stage2_latent)
+    _encoded_conditionings = []
     if is_i2v:
         print(
-            f"{Colors.BLUE}🖼️  Loading VAE encoder and encoding image...{Colors.RESET}"
+            f"{Colors.BLUE}🖼️  Loading VAE encoder and encoding {len(_conditioning_inputs)} image(s)...{Colors.RESET}"
         )
         vae_encoder = load_vae_encoder(
             (
@@ -1444,13 +1479,10 @@ def generate_video_with_audio(
             mx.eval(latent)
             return latent
 
-        if image is not None:
-            stage1_image_latent = _encode_image(image, height // 2, width // 2)
-            stage2_image_latent = _encode_image(image, height, width)
-
-        if last_frame_image is not None:
-            stage1_last_frame_latent = _encode_image(last_frame_image, height // 2, width // 2)
-            stage2_last_frame_latent = _encode_image(last_frame_image, height, width)
+        for ci_img, ci_idx, ci_strength in _conditioning_inputs:
+            s1 = _encode_image(ci_img, height // 2, width // 2)
+            s2 = _encode_image(ci_img, height, width)
+            _encoded_conditionings.append((ci_idx, ci_strength, s1, s2))
 
         del vae_encoder
         mx.clear_cache()
@@ -1472,19 +1504,10 @@ def generate_video_with_audio(
     # Apply I2V conditioning for stage 1 if provided
     video_state1 = None
     video_latent_shape = (1, 128, latent_frames, stage1_h, stage1_w)
-    stage1_conditionings = []
-    if stage1_image_latent is not None:
-        stage1_conditionings.append(VideoConditionByLatentIndex(
-            latent=stage1_image_latent,
-            frame_idx=image_frame_idx,
-            strength=image_strength,
-        ))
-    if stage1_last_frame_latent is not None:
-        stage1_conditionings.append(VideoConditionByLatentIndex(
-            latent=stage1_last_frame_latent,
-            frame_idx=latent_frames - 1,
-            strength=last_frame_strength,
-        ))
+    stage1_conditionings = [
+        VideoConditionByLatentIndex(latent=s1, frame_idx=fidx, strength=st)
+        for fidx, st, s1, _s2 in _encoded_conditionings
+    ]
     if stage1_conditionings:
         # PyTorch flow: create zeros -> apply conditioning -> apply noiser
         video_state1 = LatentState(
@@ -1589,19 +1612,10 @@ def generate_video_with_audio(
 
     # Apply I2V conditioning for stage 2 if provided
     video_state2 = None
-    stage2_conditionings = []
-    if stage2_image_latent is not None:
-        stage2_conditionings.append(VideoConditionByLatentIndex(
-            latent=stage2_image_latent,
-            frame_idx=image_frame_idx,
-            strength=image_strength,
-        ))
-    if stage2_last_frame_latent is not None:
-        stage2_conditionings.append(VideoConditionByLatentIndex(
-            latent=stage2_last_frame_latent,
-            frame_idx=latent_frames - 1,
-            strength=last_frame_strength,
-        ))
+    stage2_conditionings = [
+        VideoConditionByLatentIndex(latent=s2, frame_idx=fidx, strength=st)
+        for fidx, st, _s1, s2 in _encoded_conditionings
+    ]
     if stage2_conditionings:
         # PyTorch flow: start with upscaled latent -> apply conditioning -> apply noiser
         video_state2 = LatentState(
@@ -1977,6 +1991,15 @@ Examples:
         help="Last-frame conditioning strength (1.0 = full denoise, 0.0 = keep original, default: 1.0)",
     )
     parser.add_argument(
+        "--keyframe",
+        nargs=2,
+        action="append",
+        metavar=("IMAGE", "POSITION"),
+        default=None,
+        help="Conditioning keyframe: image path and timeline position (0.0-1.0). "
+        "Can be repeated. Cannot be used with --image or --last-frame-image.",
+    )
+    parser.add_argument(
         "--tiling",
         type=str,
         default="auto",
@@ -1995,6 +2018,14 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    parsed_keyframes = None
+    if args.keyframe is not None:
+        if args.image is not None or args.last_frame_image is not None:
+            parser.error("--keyframe cannot be used with --image or --last-frame-image")
+        parsed_keyframes = [
+            {"image": img, "position": float(pos)} for img, pos in args.keyframe
+        ]
 
     generate_video_with_audio(
         model_repo=args.model_repo,
@@ -2021,6 +2052,7 @@ Examples:
         image_frame_idx=args.image_frame_idx,
         last_frame_image=args.last_frame_image,
         last_frame_strength=args.last_frame_strength,
+        keyframes=parsed_keyframes,
         tiling=args.tiling,
         no_audio=args.no_audio,
     )

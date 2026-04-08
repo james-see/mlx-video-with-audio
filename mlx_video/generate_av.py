@@ -1112,9 +1112,10 @@ def generate_video_with_audio(
             f"{Colors.DIM}Detected LTX-2.3 distilled model family (gated attention){Colors.RESET}"
         )
 
-    # LTX-2.3 uses the ltx2 scheduler (token-dependent shifting) and disables CFG.
-    # Distilled models have guidance baked in — CFG on top causes double-guidance artifacts.
-    use_ltx2_scheduler = ltx_23_model
+    # Disable ltx2 scheduler for all models — token-dependent sigma shifting produces
+    # garbled output with the current MLX-converted 2.3 weights. Legacy fixed sigmas
+    # or linear_quadratic_schedule work correctly for both 2.0 and 2.3.
+    use_ltx2_scheduler = False
     enable_advanced_cfg = False
     effective_cfg_scale = 1.0
     effective_negative_prompt = (
@@ -1161,9 +1162,9 @@ def generate_video_with_audio(
     stage2_h, stage2_w = height // 32, width // 32
     latent_frames = 1 + (num_frames - 1) // 8
     stage1_token_count = latent_frames * stage1_h * stage1_w
-    # Pre-2.3 notapalindrome unified builds used fixed distilled stage sigmas + legacy Euler,
-    # not dynamic schedules tied to --steps. Keep that behavior for unified non-2.3 only.
-    legacy_unified_sampler = use_unified and not ltx_23_model
+    # All unified models (2.0 and 2.3) use fixed distilled stage sigmas + legacy Euler.
+    # The ltx2_schedule path produces garbled output with MLX-converted 2.3 weights.
+    legacy_unified_sampler = use_unified
     if legacy_unified_sampler:
         stage1_sigmas = list(DEFAULT_STAGE_1_SIGMAS)
         stage2_sigmas = list(DEFAULT_STAGE_2_SIGMAS)

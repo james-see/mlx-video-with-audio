@@ -430,7 +430,7 @@ class LTX2VideoDecoder(nn.Module):
                     dims=3,
                     in_channels=current_channels,
                     stride=stride,
-                    residual=True,
+                    residual=params.get("residual", False),
                     out_channels_reduction_factor=reduction,
                     spatial_padding_mode=spatial_padding_mode,
                 )

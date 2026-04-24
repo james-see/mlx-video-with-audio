@@ -242,16 +242,20 @@ def is_unified_mlx_model(model_path: Path) -> bool:
 
 
 def _looks_like_text_config(config_dict: dict) -> bool:
+    if "text_config" in config_dict and isinstance(config_dict["text_config"], dict):
+        return True
+    model_type = str(config_dict.get("model_type", "")).lower()
+    if model_type.startswith("gemma"):
+        return True
     required = {
         "hidden_size",
         "num_hidden_layers",
         "num_attention_heads",
         "num_key_value_heads",
-        "vocab_size",
     }
-    if "text_config" in config_dict and isinstance(config_dict["text_config"], dict):
+    if required.issubset(set(config_dict.keys())):
         return True
-    return required.issubset(set(config_dict.keys()))
+    return False
 
 
 def _is_ltx_23_model(model_repo: Optional[str], model_path: Path) -> bool:
@@ -270,8 +274,19 @@ def _is_ltx_23_model(model_repo: Optional[str], model_path: Path) -> bool:
         return False
 
 
+def _is_av_model_config(config_dict: dict) -> bool:
+    """Return True if config_dict looks like an AV model config, not a text encoder."""
+    return (
+        config_dict.get("model_type") == "AudioVideo" or "audio_mel_bins" in config_dict
+    )
+
+
 def validate_text_encoder_config(text_encoder_path: Path) -> None:
-    """Validate that the resolved text encoder path contains a usable config."""
+    """Validate that the resolved text encoder path contains a usable config.
+
+    If the config looks wrong (e.g. corrupted cache), attempts a single
+    force-redownload of the default Gemma text encoder before raising.
+    """
     config_file = text_encoder_path / "config.json"
     if not config_file.exists():
         raise ValueError(f"Text encoder config not found at {config_file}")
@@ -286,16 +301,68 @@ def validate_text_encoder_config(text_encoder_path: Path) -> None:
         file=sys.stderr,
         flush=True,
     )
-    if not _looks_like_text_config(config_dict):
+
+    if _looks_like_text_config(config_dict):
+        return
+
+    if _is_av_model_config(config_dict):
         key_preview = ", ".join(keys[:20]) if keys else "<none>"
         message = (
-            "Text encoder config is missing `text_config`. "
-            f"Resolved path: {text_encoder_path}. "
+            "Text encoder path resolved to an AV model config instead of "
+            f"a Gemma text encoder. Resolved path: {text_encoder_path}. "
             f"Top-level keys: [{key_preview}]. "
-            "Use --text-encoder-repo mlx-community/gemma-3-12b-it-bf16 or update mlx-video-with-audio."
+            "Pass --text-encoder-repo mlx-community/gemma-3-12b-it-bf16 explicitly."
         )
         print(f"TEXT_ENCODER_CONFIG_ERROR:{message}", file=sys.stderr, flush=True)
         raise ValueError(message)
+
+    # Config exists but doesn't look right — likely a corrupted/partial HF cache.
+    # Attempt a single force-redownload of the default text encoder.
+    print(
+        f"{Colors.YELLOW}Text encoder config at {text_encoder_path} looks invalid; "
+        f"attempting fresh download of {DEFAULT_UNIFIED_TEXT_ENCODER}...{Colors.RESET}",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        from huggingface_hub import snapshot_download
+
+        fresh_path = Path(
+            snapshot_download(
+                repo_id=DEFAULT_UNIFIED_TEXT_ENCODER,
+                local_files_only=False,
+                force_download=True,
+                allow_patterns=["*.safetensors", "*.json"],
+            )
+        )
+        retry_config = fresh_path / "config.json"
+        if retry_config.exists():
+            with open(retry_config, "r") as f:
+                retry_dict = json.load(f)
+            if _looks_like_text_config(retry_dict):
+                print(
+                    f"TEXT_ENCODER:RETRY_OK:{fresh_path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+    except Exception as retry_err:
+        print(
+            f"TEXT_ENCODER:RETRY_FAILED:{retry_err}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    key_preview = ", ".join(keys[:20]) if keys else "<none>"
+    message = (
+        "Text encoder config is missing `text_config`. "
+        f"Resolved path: {text_encoder_path}. "
+        f"Top-level keys: [{key_preview}]. "
+        "Try: huggingface-cli delete-cache, then retry. "
+        "Or pass --text-encoder-repo mlx-community/gemma-3-12b-it-bf16 explicitly."
+    )
+    print(f"TEXT_ENCODER_CONFIG_ERROR:{message}", file=sys.stderr, flush=True)
+    raise ValueError(message)
 
 
 def load_unified_weights(model_path: Path, prefix: str) -> dict:

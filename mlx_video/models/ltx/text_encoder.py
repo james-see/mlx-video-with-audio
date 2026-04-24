@@ -24,7 +24,14 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
 def _extract_text_config(config_dict: dict, model_path: Path) -> dict:
-    """Resolve the text encoder config payload from config.json."""
+    """Resolve the text encoder config payload from config.json.
+
+    Handles multiple config layouts:
+    1. Nested ``text_config`` dict (Gemma 3 multimodal wrapper).
+    2. Flat top-level keys (older or converted checkpoints).
+    3. Gemma-family ``model_type`` with nested ``text_config`` missing some
+       fields — still valid; ``TextConfig`` provides defaults.
+    """
     nested_config = config_dict.get("text_config")
     if isinstance(nested_config, dict):
         return nested_config
@@ -35,19 +42,32 @@ def _extract_text_config(config_dict: dict, model_path: Path) -> dict:
         "num_hidden_layers",
         "num_attention_heads",
         "num_key_value_heads",
-        "vocab_size",
     }
     if flat_required.issubset(set(config_dict.keys())):
         return config_dict
 
+    # Gemma multimodal configs always contain text_config; if we got here the
+    # download is likely corrupt.  Distinguish from AV model configs so the
+    # error message is actionable.
+    model_type = str(config_dict.get("model_type", ""))
+    if model_type == "AudioVideo" or "audio_mel_bins" in config_dict:
+        keys = sorted(config_dict.keys())
+        key_preview = ", ".join(keys[:20]) if keys else "<none>"
+        raise ValueError(
+            "Text encoder config path resolved to an AV model config, not a "
+            f"Gemma text encoder. Path: {model_path}. "
+            f"Top-level keys: [{key_preview}]. "
+            "Pass --text-encoder-repo mlx-community/gemma-3-12b-it-bf16 or "
+            "update mlx-video-with-audio."
+        )
+
     keys = sorted(config_dict.keys())
     key_preview = ", ".join(keys[:20]) if keys else "<none>"
     raise ValueError(
-        "Text encoder config is missing `text_config` at "
-        f"{model_path}. Found top-level keys: [{key_preview}]. "
-        "This path appears to be a unified AV model config, not a Gemma text "
-        "encoder config. Use --text-encoder-repo mlx-community/gemma-3-12b-it-bf16 "
-        "or update mlx-video-with-audio."
+        f"Text encoder config at {model_path} is missing expected keys. "
+        f"Top-level keys: [{key_preview}]. "
+        "Try: huggingface-cli delete-cache, then retry. "
+        "Or pass --text-encoder-repo mlx-community/gemma-3-12b-it-bf16 explicitly."
     )
 
 

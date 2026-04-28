@@ -36,13 +36,16 @@ def load_vae_encoder(model_path: str, use_unified: bool = False) -> VideoEncoder
 
     # Unified MLX format: single model.safetensors or split vae_encoder.safetensors
     unified_prefix = None
+    is_mlx_layout = False
     weights_path = None
     if use_unified:
         if (model_path / "model.safetensors").exists():
             weights_path = model_path / "model.safetensors"
             unified_prefix = "vae_encoder."
+            is_mlx_layout = True
         elif (model_path / "vae_encoder.safetensors").exists():
             weights_path = model_path / "vae_encoder.safetensors"
+            is_mlx_layout = True
 
     if weights_path is None:
         # Try to find the weights file
@@ -164,43 +167,65 @@ def load_vae_encoder(model_path: str, use_unified: bool = False) -> VideoEncoder
     # Determine prefix based on weight keys
     has_vae_prefix = any(k.startswith("vae.") for k in weights.keys())
     has_vae_encoder_prefix = any(k.startswith("vae_encoder.") for k in weights.keys())
+    has_encoder_prefix = any(k.startswith("encoder.") for k in weights.keys())
+    has_bare_keys = any(
+        k.startswith(("conv_in.", "conv_out.", "down_blocks.")) for k in weights.keys()
+    )
 
     if has_vae_encoder_prefix:
         prefix = "vae_encoder."
-        stats_prefix = "vae_encoder."
     elif has_vae_prefix:
         prefix = "vae.encoder."
-        stats_prefix = "vae.per_channel_statistics."
+    elif has_bare_keys:
+        prefix = ""
     else:
         prefix = "encoder."
-        stats_prefix = "per_channel_statistics."
 
-    # Load per-channel statistics for normalization
-    if has_vae_encoder_prefix:
-        mean_key = "vae_encoder.per_channel_statistics._mean_of_means"
-        std_key = "vae_encoder.per_channel_statistics._std_of_means"
-    else:
-        mean_key = f"{stats_prefix}mean-of-means"
-        std_key = f"{stats_prefix}std-of-means"
-    if mean_key in weights:
-        encoder.per_channel_statistics.mean = weights[mean_key]
-        print(f"  Loaded latent mean: shape {weights[mean_key].shape}")
-    if std_key in weights:
-        encoder.per_channel_statistics.std = weights[std_key]
-        print(f"  Loaded latent std: shape {weights[std_key].shape}")
+    # Load per-channel statistics for normalization.
+    # Keys vary by format: underscore (_mean_of_means) in split unified shards,
+    # hyphen (mean-of-means) in HF/legacy checkpoints.
+    mean_val = None
+    std_val = None
+    mean_candidates = [
+        "vae_encoder.per_channel_statistics._mean_of_means",
+        "per_channel_statistics._mean_of_means",
+        "per_channel_statistics.mean-of-means",
+        "vae.per_channel_statistics.mean-of-means",
+    ]
+    std_candidates = [
+        "vae_encoder.per_channel_statistics._std_of_means",
+        "per_channel_statistics._std_of_means",
+        "per_channel_statistics.std-of-means",
+        "vae.per_channel_statistics.std-of-means",
+    ]
+    for cand in mean_candidates:
+        if cand in weights:
+            mean_val = weights[cand]
+            break
+    for cand in std_candidates:
+        if cand in weights:
+            std_val = weights[cand]
+            break
+    if mean_val is not None:
+        encoder.per_channel_statistics.mean = mean_val
+        print(f"  Loaded latent mean: shape {mean_val.shape}")
+    if std_val is not None:
+        encoder.per_channel_statistics.std = std_val
+        print(f"  Loaded latent std: shape {std_val.shape}")
 
     # Build encoder weights dict with key remapping
     encoder_weights = {}
     for key, value in weights.items():
-        if not key.startswith(prefix):
+        if prefix and not key.startswith(prefix):
+            continue
+        if not prefix and key.startswith("per_channel_statistics"):
             continue
 
-        # Remove prefix
-        new_key = key[len(prefix) :]
+        new_key = key[len(prefix) :] if prefix else key
 
-        # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
-        # Skip when loading from unified model - convert script already saved MLX format
-        if ".weight" in key and value.ndim == 5 and not unified_prefix:
+        # Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
+        # Skip for MLX-layout weights (unified single file or split shards).
+        if ".weight" in key and value.ndim == 5 and not is_mlx_layout:
             value = mx.transpose(value, (0, 2, 3, 4, 1))
 
         encoder_weights[new_key] = value

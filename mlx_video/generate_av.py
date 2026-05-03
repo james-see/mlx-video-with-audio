@@ -80,6 +80,79 @@ DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
+def _estimate_array_nbytes(value) -> int:
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+
+    size = getattr(value, "size", None)
+    dtype = getattr(value, "dtype", None)
+    if not isinstance(size, int) or dtype is None:
+        return 0
+
+    dtype_name = str(dtype)
+    if "float64" in dtype_name or "int64" in dtype_name:
+        itemsize = 8
+    elif "float32" in dtype_name or "int32" in dtype_name:
+        itemsize = 4
+    elif "float16" in dtype_name or "bfloat16" in dtype_name or "int16" in dtype_name:
+        itemsize = 2
+    else:
+        itemsize = 1
+    return size * itemsize
+
+
+def _eval_tree_in_chunks(
+    tree,
+    label: str,
+    max_chunk_bytes: int = 512 * 1024 * 1024,
+    max_chunk_arrays: int = 16,
+):
+    """Materialize MLX arrays in smaller command buffers.
+
+    Large models can otherwise build one huge Metal command buffer when calling
+    mx.eval(module.parameters()), which can trip macOS's interactivity watchdog
+    before generation starts.
+    """
+    arrays = [
+        value
+        for _, value in mx_utils.tree_flatten(tree)
+        if hasattr(value, "shape") and hasattr(value, "dtype")
+    ]
+    print(f"{label}:EVAL_START:{len(arrays)}", file=sys.stderr, flush=True)
+
+    chunk = []
+    chunk_bytes = 0
+    chunks = 0
+
+    def flush_chunk():
+        nonlocal chunk, chunk_bytes, chunks
+        if not chunk:
+            return
+        chunks += 1
+        print(
+            f"{label}:EVAL_CHUNK:{chunks}:{len(chunk)}:{chunk_bytes}",
+            file=sys.stderr,
+            flush=True,
+        )
+        mx.eval(*chunk)
+        chunk = []
+        chunk_bytes = 0
+
+    for value in arrays:
+        value_bytes = _estimate_array_nbytes(value)
+        if chunk and (
+            len(chunk) >= max_chunk_arrays
+            or chunk_bytes + value_bytes > max_chunk_bytes
+        ):
+            flush_chunk()
+        chunk.append(value)
+        chunk_bytes += value_bytes
+
+    flush_chunk()
+    print(f"{label}:EVAL_COMPLETE:{chunks}", file=sys.stderr, flush=True)
+
+
 def adain_filter_latent(
     latents: mx.array, reference_latents: mx.array, factor: float = 1.0
 ) -> mx.array:
@@ -1251,6 +1324,7 @@ def generate_video_with_audio(
 
     # Load text encoder with audio embeddings
     print(f"{Colors.BLUE}📝 Loading text encoder...{Colors.RESET}")
+    print("TEXT_ENCODER:LOAD_START", file=sys.stderr, flush=True)
     from mlx_video.models.ltx.text_encoder import LTX2TextEncoder
 
     text_encoder = LTX2TextEncoder()
@@ -1259,7 +1333,8 @@ def generate_video_with_audio(
         text_encoder_path=text_encoder_path,
         use_unified=use_unified,
     )
-    mx.eval(text_encoder.parameters())
+    print("TEXT_ENCODER:LOAD_COMPLETE", file=sys.stderr, flush=True)
+    _eval_tree_in_chunks(text_encoder.parameters(), "TEXT_ENCODER")
 
     # Optionally enhance prompt
     if enhance_prompt:
@@ -1316,9 +1391,11 @@ def generate_video_with_audio(
             )
 
     # Get both video and audio embeddings
+    print("TEXT_ENCODER:ENCODE_START", file=sys.stderr, flush=True)
     video_embeddings, audio_embeddings, text_attention_mask = text_encoder(
         prompt, max_length=1024
     )
+    print("TEXT_ENCODER:ENCODE_POSITIVE_COMPLETE", file=sys.stderr, flush=True)
     cfg_enabled = effective_cfg_scale > 1.0 and bool(
         str(effective_negative_prompt).strip()
     )
@@ -1328,6 +1405,7 @@ def generate_video_with_audio(
             audio_embeddings_negative,
             negative_attention_mask,
         ) = text_encoder(effective_negative_prompt, max_length=1024)
+        print("TEXT_ENCODER:ENCODE_NEGATIVE_COMPLETE", file=sys.stderr, flush=True)
     else:
         video_embeddings_negative = None
         audio_embeddings_negative = None
@@ -1344,6 +1422,7 @@ def generate_video_with_audio(
             ]
         )
     mx.eval(*tensors_to_eval)
+    print("TEXT_ENCODER:ENCODE_COMPLETE", file=sys.stderr, flush=True)
 
     del text_encoder
     mx.clear_cache()
@@ -1476,7 +1555,7 @@ def generate_video_with_audio(
             pass
 
     transformer.load_weights(list(sanitized.items()), strict=False)
-    mx.eval(transformer.parameters())
+    _eval_tree_in_chunks(transformer.parameters(), "TRANSFORMER")
 
     # Load VAE encoder and encode image for I2V conditioning
     stage1_image_latent = None

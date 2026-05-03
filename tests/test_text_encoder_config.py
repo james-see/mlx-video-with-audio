@@ -174,3 +174,39 @@ class TestValidateTextEncoderConfig:
             )
             with pytest.raises(ValueError, match="AV model config"):
                 validate_text_encoder_config(Path(tmp))
+
+
+class TestChunkedEval:
+    """Tests for watchdog-safe MLX eval chunking."""
+
+    def test_estimate_array_nbytes_prefers_nbytes(self):
+        from mlx_video.generate_av import _estimate_array_nbytes
+
+        class FakeArray:
+            nbytes = 123
+            size = 999
+            dtype = "float32"
+
+        assert _estimate_array_nbytes(FakeArray()) == 123
+
+    def test_eval_tree_in_chunks_splits_by_array_count(self, monkeypatch):
+        import mlx.core as mx
+
+        from mlx_video import generate_av
+
+        calls = []
+
+        def fake_eval(*arrays):
+            calls.append(len(arrays))
+
+        monkeypatch.setattr(generate_av.mx, "eval", fake_eval)
+
+        tree = {"a": mx.array([1]), "b": mx.array([2]), "c": mx.array([3])}
+        generate_av._eval_tree_in_chunks(
+            tree,
+            "TEST",
+            max_chunk_bytes=1024 * 1024,
+            max_chunk_arrays=2,
+        )
+
+        assert calls == [2, 1]

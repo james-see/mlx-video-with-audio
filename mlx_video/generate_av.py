@@ -1170,6 +1170,7 @@ def generate_video_with_audio(
     image: Optional[str] = None,
     image_strength: float = 1.0,
     image_frame_idx: int = 0,
+    keyframes: Optional[list] = None,
     tiling: str = "auto",
     num_inference_steps: int = 30,
     no_audio: bool = False,
@@ -1224,7 +1225,30 @@ def generate_video_with_audio(
     # Calculate audio frames
     audio_frames = compute_audio_frames(num_frames, fps)
 
-    is_i2v = image is not None
+    # Normalize conditioning into a unified list of keyframes.
+    # Each entry: {"path": str, "frame_idx": int, "strength": float}.
+    # `keyframes` (multi-image) takes precedence; otherwise fall back to the
+    # legacy single `image` argument for backward compatibility.
+    _keyframes = []
+    if keyframes:
+        for kf in keyframes:
+            _keyframes.append(
+                {
+                    "path": kf["path"],
+                    "frame_idx": int(kf.get("frame_idx", 0)),
+                    "strength": float(kf.get("strength", 1.0)),
+                }
+            )
+    elif image is not None:
+        _keyframes.append(
+            {
+                "path": image,
+                "frame_idx": int(image_frame_idx),
+                "strength": float(image_strength),
+            }
+        )
+
+    is_i2v = len(_keyframes) > 0
     mode_str = "I2V+Audio" if is_i2v else "T2V+Audio"
     print(
         f"{Colors.BOLD}{Colors.CYAN}🎬 [{mode_str}] Generating {width}x{height} video with {num_frames} frames + audio{Colors.RESET}"
@@ -1236,9 +1260,11 @@ def generate_video_with_audio(
         f"{Colors.DIM}Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}{Colors.RESET}"
     )
     if is_i2v:
-        print(
-            f"{Colors.DIM}Image: {image} (strength={image_strength}, frame={image_frame_idx}){Colors.RESET}"
-        )
+        for _kf in _keyframes:
+            print(
+                f"{Colors.DIM}Keyframe: {_kf['path']} "
+                f"(strength={_kf['strength']}, frame={_kf['frame_idx']}){Colors.RESET}"
+            )
 
     from mlx_video.version import __version__ as mlx_video_version
 
@@ -1557,12 +1583,13 @@ def generate_video_with_audio(
     transformer.load_weights(list(sanitized.items()), strict=False)
     _eval_tree_in_chunks(transformer.parameters(), "TRANSFORMER")
 
-    # Load VAE encoder and encode image for I2V conditioning
-    stage1_image_latent = None
-    stage2_image_latent = None
+    # Load VAE encoder and encode each keyframe image for I2V conditioning
+    stage1_image_latents = []
+    stage2_image_latents = []
     if is_i2v:
         print(
-            f"{Colors.BLUE}🖼️  Loading VAE encoder and encoding image...{Colors.RESET}"
+            f"{Colors.BLUE}🖼️  Loading VAE encoder and encoding "
+            f"{len(_keyframes)} keyframe image(s)...{Colors.RESET}"
         )
         vae_encoder = load_vae_encoder(
             (
@@ -1574,23 +1601,28 @@ def generate_video_with_audio(
         )
         mx.eval(vae_encoder.parameters())
 
-        # Load and prepare image for stage 1 (half resolution)
-        input_image = load_image(
-            image, height=height // 2, width=width // 2, dtype=model_dtype
-        )
-        stage1_image_tensor = prepare_image_for_encoding(
-            input_image, height // 2, width // 2, dtype=model_dtype
-        )
-        stage1_image_latent = vae_encoder(stage1_image_tensor)
-        mx.eval(stage1_image_latent)
+        for _kf in _keyframes:
+            # Load and prepare image for stage 1 (half resolution)
+            input_image = load_image(
+                _kf["path"], height=height // 2, width=width // 2, dtype=model_dtype
+            )
+            stage1_image_tensor = prepare_image_for_encoding(
+                input_image, height // 2, width // 2, dtype=model_dtype
+            )
+            s1_latent = vae_encoder(stage1_image_tensor)
+            mx.eval(s1_latent)
+            stage1_image_latents.append(s1_latent)
 
-        # Load and prepare image for stage 2 (full resolution)
-        input_image = load_image(image, height=height, width=width, dtype=model_dtype)
-        stage2_image_tensor = prepare_image_for_encoding(
-            input_image, height, width, dtype=model_dtype
-        )
-        stage2_image_latent = vae_encoder(stage2_image_tensor)
-        mx.eval(stage2_image_latent)
+            # Load and prepare image for stage 2 (full resolution)
+            input_image = load_image(
+                _kf["path"], height=height, width=width, dtype=model_dtype
+            )
+            stage2_image_tensor = prepare_image_for_encoding(
+                input_image, height, width, dtype=model_dtype
+            )
+            s2_latent = vae_encoder(stage2_image_tensor)
+            mx.eval(s2_latent)
+            stage2_image_latents.append(s2_latent)
 
         del vae_encoder
         mx.clear_cache()
@@ -1612,19 +1644,22 @@ def generate_video_with_audio(
     # Apply I2V conditioning for stage 1 if provided
     video_state1 = None
     video_latent_shape = (1, 128, latent_frames, stage1_h, stage1_w)
-    if is_i2v and stage1_image_latent is not None:
+    if is_i2v and stage1_image_latents:
         # PyTorch flow: create zeros -> apply conditioning -> apply noiser
         video_state1 = LatentState(
             latent=mx.zeros(video_latent_shape, dtype=model_dtype),
             clean_latent=mx.zeros(video_latent_shape, dtype=model_dtype),
             denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
         )
-        conditioning = VideoConditionByLatentIndex(
-            latent=stage1_image_latent,
-            frame_idx=image_frame_idx,
-            strength=image_strength,
-        )
-        video_state1 = apply_conditioning(video_state1, [conditioning])
+        conditionings = [
+            VideoConditionByLatentIndex(
+                latent=_lat,
+                frame_idx=min(_kf["frame_idx"], latent_frames - 1),
+                strength=_kf["strength"],
+            )
+            for _lat, _kf in zip(stage1_image_latents, _keyframes)
+        ]
+        video_state1 = apply_conditioning(video_state1, conditionings)
 
         # Apply noiser: latent = noise * (mask * noise_scale) + latent * (1 - mask * noise_scale)
         noise = mx.random.normal(video_latent_shape).astype(model_dtype)
@@ -1721,19 +1756,22 @@ def generate_video_with_audio(
 
     # Apply I2V conditioning for stage 2 if provided
     video_state2 = None
-    if is_i2v and stage2_image_latent is not None:
+    if is_i2v and stage2_image_latents:
         # PyTorch flow: start with upscaled latent -> apply conditioning -> apply noiser
         video_state2 = LatentState(
             latent=video_latents,  # Start with upscaled latent
             clean_latent=mx.zeros_like(video_latents),
             denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
         )
-        conditioning = VideoConditionByLatentIndex(
-            latent=stage2_image_latent,
-            frame_idx=image_frame_idx,
-            strength=image_strength,
-        )
-        video_state2 = apply_conditioning(video_state2, [conditioning])
+        conditionings = [
+            VideoConditionByLatentIndex(
+                latent=_lat,
+                frame_idx=min(_kf["frame_idx"], latent_frames - 1),
+                strength=_kf["strength"],
+            )
+            for _lat, _kf in zip(stage2_image_latents, _keyframes)
+        ]
+        video_state2 = apply_conditioning(video_state2, conditionings)
 
         # Apply noiser: conditioned frames (mask=0) keep image latent, unconditioned get partial noise
         video_noise = mx.random.normal(video_latents.shape).astype(model_dtype)
@@ -2089,6 +2127,17 @@ Examples:
         help="Frame index to condition for I2V (0 = first frame, default: 0)",
     )
     parser.add_argument(
+        "--keyframe",
+        action="append",
+        default=None,
+        metavar="PATH|FRAME_IDX|STRENGTH",
+        help=(
+            "Add a conditioning keyframe (repeatable). Format: "
+            "PATH|FRAME_IDX|STRENGTH (FRAME_IDX is a latent frame index; "
+            "STRENGTH optional, default 1.0). Takes precedence over --image."
+        ),
+    )
+    parser.add_argument(
         "--tiling",
         type=str,
         default="auto",
@@ -2107,6 +2156,19 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Parse repeatable --keyframe PATH|FRAME_IDX|STRENGTH specs into dicts.
+    keyframes = None
+    if args.keyframe:
+        keyframes = []
+        for spec in args.keyframe:
+            parts = spec.split("|")
+            path = parts[0]
+            frame_idx = int(parts[1]) if len(parts) > 1 and parts[1] != "" else 0
+            strength = float(parts[2]) if len(parts) > 2 and parts[2] != "" else 1.0
+            keyframes.append(
+                {"path": path, "frame_idx": frame_idx, "strength": strength}
+            )
 
     generate_video_with_audio(
         model_repo=args.model_repo,
@@ -2131,6 +2193,7 @@ Examples:
         image=args.image,
         image_strength=args.image_strength,
         image_frame_idx=args.image_frame_idx,
+        keyframes=keyframes,
         tiling=args.tiling,
         no_audio=args.no_audio,
     )
